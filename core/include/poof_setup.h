@@ -21,10 +21,15 @@ int32_t poof_setup_start(const char *_Nullable apple_id, const char *_Nullable p
                          const char *_Nullable ipa_path, const char *pairing_out,
                          bool revoke_certs, const char *_Nullable anisette_url);
 
-// Answers a pending two-factor prompt; NULL or "" aborts.
+// Answers a pending two-factor prompt: the code, or "device", "sms",
+// "sms:<id>", "resend". NULL or "" aborts.
 int32_t poof_setup_submit_code(const char *_Nullable code);
 
-// {"running":bool,"log":[...],"needs_code":bool,"code_error":str|null,
+// Stops a running setup.
+int32_t poof_setup_cancel(void);
+
+// {"running":bool,"log":[...],"needs_code":bool,
+//  "code_prompt":{"last_error":str|null,"sms":bool,"unknown":bool,"numbers":[{"id":7,"last_two":"42"}]}|null,
 //  "report":{...}|null,"error":str|null}
 char *_Nullable poof_setup_status_json(void);
 

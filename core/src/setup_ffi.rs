@@ -13,7 +13,7 @@ use tokio::sync::oneshot;
 
 use crate::{
     POOF_ERR_ARG, POOF_ERR_RUNTIME, POOF_OK, runtime,
-    setup::{self, Install, Options, Report, TwoFactor},
+    setup::{self, Install, Options, Report, TwoFactor, TwoFactorPrompt},
     str_arg,
 };
 
@@ -25,11 +25,13 @@ struct State {
     log: Vec<String>,
     /// Apple is waiting for a two-factor code.
     needs_code: bool,
-    code_error: Option<String>,
+    code_prompt: Option<TwoFactorPrompt>,
     report: Option<Report>,
     error: Option<String>,
     #[serde(skip)]
     code_tx: Option<oneshot::Sender<Option<String>>>,
+    #[serde(skip)]
+    task: Option<tokio::task::AbortHandle>,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -71,22 +73,27 @@ pub unsafe extern "C" fn poof_setup_start(
     let Some(rt) = runtime() else {
         return POOF_ERR_RUNTIME;
     };
-    if with_state(|s| s.running) {
-        return POOF_ERR_BUSY;
-    }
-    with_state(|s| {
+    // Check and claim in one lock so two calls cannot both start.
+    let claimed = with_state(|s| {
+        if s.running {
+            return false;
+        }
         *s = State {
             running: true,
             ..Default::default()
-        }
+        };
+        true
     });
+    if !claimed {
+        return POOF_ERR_BUSY;
+    }
 
-    let two_factor: TwoFactor = Arc::new(|last_error| {
+    let two_factor: TwoFactor = Arc::new(|prompt| {
         Box::pin(async move {
             let (tx, rx) = oneshot::channel();
             with_state(|s| {
                 s.needs_code = true;
-                s.code_error = last_error;
+                s.code_prompt = Some(prompt);
                 s.code_tx = Some(tx);
             });
             let code = rx.await.ok().flatten();
@@ -101,22 +108,45 @@ pub unsafe extern "C" fn poof_setup_start(
         two_factor,
         log: Arc::new(|m| with_state(|s| s.log.push(m.to_string()))),
     };
-    rt.spawn(async move {
+    let task = rt.spawn(async move {
         let res = setup::run(opts).await;
         with_state(|s| {
             s.running = false;
             s.needs_code = false;
             s.code_tx = None;
+            s.task = None;
             match res {
                 Ok(r) => s.report = Some(r),
                 Err(e) => s.error = Some(e),
             }
         });
     });
+    with_state(|s| {
+        if s.running {
+            s.task = Some(task.abort_handle());
+        }
+    });
     POOF_OK
 }
 
-/// Answers a pending two-factor prompt. Null or empty aborts the sign-in.
+/// Stops a running setup (for example while it waits for Trust).
+#[unsafe(no_mangle)]
+pub extern "C" fn poof_setup_cancel() -> i32 {
+    with_state(|s| match s.task.take() {
+        Some(t) => {
+            t.abort();
+            s.running = false;
+            s.needs_code = false;
+            s.code_tx = None;
+            s.error = Some("Cancelled".into());
+            POOF_OK
+        }
+        None => POOF_ERR_ARG,
+    })
+}
+
+/// Answers a pending two-factor prompt: the code, or `device`, `sms`,
+/// `sms:<id>`, `resend`. Null or empty aborts the sign-in.
 ///
 /// # Safety
 /// `code` must be null or a valid NUL-terminated string.

@@ -22,10 +22,23 @@ struct SetupStatus: Decodable {
         var appPushError: String?
     }
 
+    struct CodePrompt: Decodable {
+        struct Phone: Decodable {
+            var id: UInt32
+            var lastTwo: String
+        }
+
+        var lastError: String?
+        var sms: Bool
+        /// The last method failed: pick one (devices / SMS) before a code.
+        var unknown: Bool
+        var numbers: [Phone]
+    }
+
     var running = false
     var log: [String] = []
     var needsCode = false
-    var codeError: String?
+    var codePrompt: CodePrompt?
     var report: Report?
     var error: String?
 }
@@ -70,14 +83,31 @@ final class SetupModel: ObservableObject {
             }
         }
         tick += 1
-        // usbmuxd query can take a moment; check devices every 2 s while idle.
+        // Check for a plugged-in iPhone every 2 s while idle.
         if tick % 4 == 0, !status.running { refreshDevices() }
     }
 
+    private var checkingDevices = false
+
+    /// The usbmuxd query can block for up to 2 s; keep it off the main thread.
     private func refreshDevices() {
-        guard let p = poof_usb_devices_json() else { return }
-        defer { poof_string_free(p) }
-        devices = (try? JSONDecoder().decode([String].self, from: Data(String(cString: p).utf8))) ?? []
+        guard !checkingDevices else { return }
+        checkingDevices = true
+        Task.detached {
+            var found: [String] = []
+            if let p = poof_usb_devices_json() {
+                found = (try? JSONDecoder().decode([String].self, from: Data(String(cString: p).utf8))) ?? []
+                poof_string_free(p)
+            }
+            await MainActor.run {
+                self.devices = found
+                self.checkingDevices = false
+            }
+        }
+    }
+
+    func cancel() {
+        _ = poof_setup_cancel()
     }
 
     func install(appleID: String, password: String, ipa: URL, revoke: Bool, anisette: String?) {

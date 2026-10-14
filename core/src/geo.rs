@@ -83,6 +83,13 @@ impl Mover {
                 .points
                 .iter()
                 .all(|c| Coord::new(c.lat, c.lon).is_some());
+        // A looping route with no length would make `advance` spin forever.
+        let length: f64 = route
+            .points
+            .windows(2)
+            .map(|w| w[0].distance_to(&w[1]))
+            .sum();
+        let valid = valid && !(route.repeat && length < 1.0);
         valid.then_some(Self {
             route,
             segment: 0,
@@ -218,5 +225,20 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    #[test]
+    fn rejects_zero_length_loop() {
+        let p = c(1.0, 1.0);
+        let r = |repeat| Route {
+            points: vec![p, p],
+            speed_mps: 1.0,
+            repeat,
+        };
+        assert!(Mover::new(r(true)).is_none());
+        // Non-repeating is fine: it finishes on the first step.
+        let mut m = Mover::new(r(false)).unwrap();
+        assert_eq!(m.advance(1.0), p);
+        assert!(m.finished());
     }
 }

@@ -20,6 +20,8 @@ struct EngineStatus: Decodable, Equatable {
     static let stopped = EngineStatus(phase: "stopped")
 
     var isRunning: Bool { phase != "stopped" }
+    /// Stuck until something changes: retrying on a timer, or failed outright.
+    var isStuck: Bool { phase == "retrying" || phase == "failed" }
     var isActive: Bool { phase == "active" }
 }
 
@@ -45,6 +47,8 @@ final class PoofEngine: ObservableObject {
     @Published private(set) var status = EngineStatus.stopped
 
     private var timer: Timer?
+    /// Settings the running engine was started with.
+    private var startedWith: [String]?
     private let decoder: JSONDecoder = {
         let d = JSONDecoder()
         d.keyDecodingStrategy = .convertFromSnakeCase
@@ -55,15 +59,19 @@ final class PoofEngine: ObservableObject {
         status.target.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon) }
     }
 
-    /// Starts the engine if it is not running. Returns a user-facing error.
+    /// Starts the engine if it is not running, or restarts it when it is
+    /// stuck or its settings changed (pairing file, address, disk image,
+    /// re-send interval are fixed when the engine starts). Returns a
+    /// user-facing error.
     @discardableResult
     func ensureStarted(_ store: AppStore) -> String? {
         refresh()
-        if status.isRunning { return nil }
         guard store.hasPairingFile else { return "Import a pairing file first (Setup)." }
 
         let ddi = store.hasDDI ? store.ddiDirectory.path : nil
         let refresh = UInt32(max(0, store.refreshSeconds))
+        let config = [store.pairingURL.path, store.deviceIP, ddi ?? "", String(refresh), store.pairingStamp]
+        if status.isRunning, !status.isStuck, config == startedWith { return nil }
         let rc: Int32
         if let ddi {
             rc = poof_start(store.pairingURL.path, store.deviceIP, ddi, refresh)
@@ -71,6 +79,7 @@ final class PoofEngine: ObservableObject {
             rc = poof_start(store.pairingURL.path, store.deviceIP, nil, refresh)
         }
         guard rc == POOF_OK else { return "Engine failed to start (\(rc)). Check the device IP." }
+        startedWith = config
 
         KeepAlive.shared.start()
         self.refresh()
@@ -125,6 +134,8 @@ final class PoofEngine: ObservableObject {
         let data = Data(String(cString: ptr).utf8)
         if let s = try? decoder.decode(EngineStatus.self, from: data), s != status {
             status = s
+            // Nothing to keep alive for until the user acts again.
+            if s.phase == "failed" { KeepAlive.shared.stop() }
         }
     }
 

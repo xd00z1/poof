@@ -28,19 +28,24 @@ fn cfg(pairing: PathBuf) -> Config {
 }
 
 #[tokio::test]
-async fn bad_pairing_file_retries_and_keeps_target() {
+async fn bad_pairing_file_fails_until_asked_again() {
     let engine = Engine::spawn(
         &tokio::runtime::Handle::current(),
         cfg("/nonexistent.plist".into()),
     );
-    assert!(wait_for(&engine, |s| s.phase == Phase::Retrying).await);
+    // Unfixable by waiting: no timer retries, it parks in Failed.
+    assert!(wait_for(&engine, |s| s.phase == Phase::Failed).await);
     let st = engine.status();
     assert!(st.last_error.unwrap().contains("pairing file"));
-    assert!(st.reconnects >= 1);
+    assert_eq!(st.reconnects, 1);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(engine.status().reconnects, 1, "retried on a timer");
 
+    // A new target is the cue to try again.
     let paris = Coord::new(48.8584, 2.2945).unwrap();
     engine.send(Command::Set(paris));
-    assert!(wait_for(&engine, |s| s.target == Some(paris)).await);
+    assert!(wait_for(&engine, |s| s.target == Some(paris) && s.reconnects == 2).await);
+    assert_eq!(engine.status().phase, Phase::Failed);
 
     engine.send(Command::Shutdown);
     assert!(wait_for(&engine, |s| s.phase == Phase::Stopped).await);

@@ -177,6 +177,7 @@ struct StatusPill: View {
         case "connecting": "Connecting…"
         case "mounting_ddi": "Mounting developer image…"
         case "retrying": "Reconnecting…"
+        case "failed": "Needs attention"
         default: "Real GPS"
         }
     }
@@ -186,6 +187,7 @@ struct StatusPill: View {
         case "active": .green
         case "connecting", "mounting_ddi": .yellow
         case "retrying": .orange
+        case "failed": .red
         default: .gray
         }
     }

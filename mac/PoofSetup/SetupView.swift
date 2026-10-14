@@ -54,7 +54,11 @@ struct SetupView: View {
         }
         .padding(24)
         .onAppear { model.startPolling() }
-        .sheet(isPresented: .constant(model.status.needsCode)) { twoFactorSheet }
+        .sheet(isPresented: Binding(
+            get: { model.status.needsCode },
+            // Dismissed with Escape: treat as cancelling sign-in.
+            set: { shown in if !shown && model.status.needsCode { model.submit(code: nil) } }
+        )) { twoFactorSheet }
     }
 
     private var header: some View {
@@ -131,7 +135,12 @@ struct SetupView: View {
     @ViewBuilder
     private var progress: some View {
         if model.status.running {
-            HStack { ProgressView().controlSize(.small); Text("Working… keep the iPhone plugged in and unlocked.") }
+            HStack {
+                ProgressView().controlSize(.small)
+                Text("Working… keep the iPhone plugged in and unlocked.")
+                Spacer()
+                Button("Cancel") { model.cancel() }
+            }
         }
         ScrollView {
             VStack(alignment: .leading, spacing: 4) {
@@ -174,33 +183,55 @@ struct SetupView: View {
     }
 
     private var twoFactorSheet: some View {
-        VStack(spacing: 14) {
+        let prompt = model.status.codePrompt
+        return VStack(spacing: 14) {
             Text("Two-factor code").font(.title2.bold())
-            Text("Enter the 6-digit code Apple sent to your devices.")
-                .foregroundStyle(.secondary)
-            if let e = model.status.codeError {
+            if prompt?.unknown == true {
+                Text("That method didn't work. Choose where Apple should send a code.")
+                    .foregroundStyle(.secondary)
+            } else {
+                Text(prompt?.sms == true
+                     ? "Enter the 6-digit code Apple texted you."
+                     : "Enter the 6-digit code shown on your Apple devices.")
+                    .foregroundStyle(.secondary)
+            }
+            if let e = prompt?.lastError {
                 Text(e).foregroundStyle(.red).font(.caption)
             }
-            TextField("123456", text: $code)
-                .font(.title.monospaced())
-                .multilineTextAlignment(.center)
-                .frame(width: 180)
-                .onSubmit(submitCode)
+            if prompt?.unknown != true {
+                TextField("123456", text: $code)
+                    .font(.title.monospaced())
+                    .multilineTextAlignment(.center)
+                    .frame(width: 180)
+                    .onSubmit(submitCode)
+            }
+            HStack {
+                Button("Send to my devices") { model.submit(code: "device") }
+                ForEach(prompt?.numbers ?? [], id: \.id) { phone in
+                    Button("Text ••\(phone.lastTwo)") { model.submit(code: "sms:\(phone.id)") }
+                }
+                if prompt?.unknown != true {
+                    Button("Resend") { model.submit(code: "resend") }
+                }
+            }
+            .controlSize(.small)
             HStack {
                 Button("Cancel", role: .cancel) {
                     model.submit(code: nil)
                     code = ""
                 }
-                Button("Continue", action: submitCode)
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(code.trimmingCharacters(in: .whitespaces).count < 6)
+                if prompt?.unknown != true {
+                    Button("Continue", action: submitCode)
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(code.filter(\.isNumber).count < 6)
+                }
             }
         }
         .padding(28)
     }
 
     private func submitCode() {
-        model.submit(code: code.trimmingCharacters(in: .whitespaces))
+        model.submit(code: code.filter(\.isNumber))
         code = ""
     }
 

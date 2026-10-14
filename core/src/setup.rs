@@ -36,6 +36,8 @@ use idevice::{
 };
 
 pub const APP_BUNDLE_ID: &str = "app.poof.Poof";
+/// How long to wait for the user to unlock the phone and tap Trust.
+const PAIR_TIMEOUT: Duration = Duration::from_secs(180);
 /// Name the app looks for in its Documents folder.
 const PAIRING_NAME: &str = "poof.mobiledevicepairing";
 
@@ -110,10 +112,52 @@ pub fn default_state_dir() -> PathBuf {
     }
 }
 
-/// Asked for a 2FA code; receives Apple's last error, if any. `None` aborts.
+/// What Apple wants for two-factor sign-in, shown to the user.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TwoFactorPrompt {
+    pub last_error: Option<String>,
+    /// A code was sent by SMS (otherwise to trusted devices).
+    pub sms: bool,
+    /// The last method failed; the user must pick a method before a code.
+    pub unknown: bool,
+    pub numbers: Vec<TrustedPhone>,
+}
+
+/// A trusted phone number Apple can text a code to.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TrustedPhone {
+    pub id: u32,
+    pub last_two: String,
+}
+
+/// Asks the user for a 2FA answer. `None` aborts. An answer is the code
+/// itself, or one of `device` (push to trusted devices), `sms` / `sms:<id>`
+/// (text a trusted number), `resend`.
 pub type TwoFactor = Arc<
-    dyn Fn(Option<String>) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync,
+    dyn Fn(TwoFactorPrompt) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync,
 >;
+
+fn two_factor_response(p: &TwoFactorPrompt, answer: &str) -> TwoFactorCallbackResponse {
+    let answer = answer.trim();
+    let first_number = p.numbers.first().map(|n| n.id);
+    match answer {
+        "device" => TwoFactorCallbackResponse::SendToDevices,
+        "resend" if p.unknown => TwoFactorCallbackResponse::SendToDevices,
+        "resend" => TwoFactorCallbackResponse::ResendCode,
+        "sms" => match first_number {
+            Some(id) => TwoFactorCallbackResponse::SendSms(id),
+            None => TwoFactorCallbackResponse::SendToDevices,
+        },
+        a if a.starts_with("sms:") => match a[4..].parse() {
+            Ok(id) => TwoFactorCallbackResponse::SendSms(id),
+            Err(_) => TwoFactorCallbackResponse::ResendCode,
+        },
+        // isideload refuses a code while no method is selected; pick devices
+        // and it will ask again.
+        _ if p.unknown => TwoFactorCallbackResponse::SendToDevices,
+        code => TwoFactorCallbackResponse::SubmitCode(code.replace(' ', "")),
+    }
+}
 pub type Log = Arc<dyn Fn(&str) + Send + Sync>;
 
 pub struct Options {
@@ -150,12 +194,20 @@ pub async fn run(opts: Options) -> Result<Report, String> {
 
     log("Unlock the iPhone and tap Trust (enter the passcode if asked)");
     let host_id = uuid::Uuid::new_v4().to_string().to_uppercase();
+    let deadline = tokio::time::Instant::now() + PAIR_TIMEOUT;
     let mut pairing = loop {
+        if tokio::time::Instant::now() > deadline {
+            return Err(
+                "timed out waiting for Trust on the iPhone (unlock it and try again)".into(),
+            );
+        }
         let mut lockdown = LockdownClient::connect(&usb).await.map_err(e("lockdown"))?;
-        match lockdown
-            .pair(host_id.clone(), buid.clone(), Some("Poof"))
-            .await
-        {
+        let attempt = tokio::time::timeout_at(
+            deadline,
+            lockdown.pair(host_id.clone(), buid.clone(), Some("Poof")),
+        );
+        let Ok(result) = attempt.await else { continue };
+        match result {
             Ok(p) => break p,
             // Raised while the phone is locked; the dialog appears once it is unlocked.
             Err(IdeviceError::PasswordProtected) => {
@@ -197,7 +249,10 @@ pub async fn run(opts: Options) -> Result<Report, String> {
         "Paired with iOS {ios_version}; network access enabled"
     ));
 
-    let bytes = pairing.serialize().map_err(e("serialize pairing file"))?;
+    let bytes = pairing
+        .clone()
+        .serialize()
+        .map_err(e("serialize pairing file"))?;
     std::fs::write(&opts.out, &bytes)
         .map_err(|err| format!("write {}: {err}", opts.out.display()))?;
     log(&format!("Saved pairing file to {}", opts.out.display()));
@@ -232,15 +287,23 @@ pub async fn run(opts: Options) -> Result<Report, String> {
         installed = true;
     }
 
+    // The install takes about a minute; if the phone auto-locked meanwhile,
+    // writing into the app's container can fail until it is unlocked.
     let mut app_push_error = None;
-    for id in &bundle_ids {
-        match push_to_app(&provider, id, &bytes).await {
-            Ok(()) => {
-                log("Copied pairing file into Poof");
-                app_push_error = None;
-                break;
+    'attempts: for attempt in 0..4 {
+        if attempt > 0 {
+            log("Unlock the iPhone to finish (copying the pairing file into Poof)");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        for id in &bundle_ids {
+            match push_to_app(&provider, &pairing, id, &bytes).await {
+                Ok(()) => {
+                    log("Copied pairing file into Poof");
+                    app_push_error = None;
+                    break 'attempts;
+                }
+                Err(err) => app_push_error = Some(err),
             }
-            Err(err) => app_push_error = Some(err),
         }
     }
 
@@ -301,9 +364,22 @@ async fn sign_in(
         .anisette_provider(anisette)
         .login(&inst.password, move |p: TwoFactorCallbackParams| {
             let tf = tf.clone();
+            let prompt = TwoFactorPrompt {
+                last_error: p.last_error,
+                sms: p.sms,
+                unknown: p.unknown,
+                numbers: p
+                    .numbers
+                    .into_iter()
+                    .map(|n| TrustedPhone {
+                        id: n.id,
+                        last_two: n.last_two_digits,
+                    })
+                    .collect(),
+            };
             async move {
-                Ok(match tf(p.last_error).await {
-                    Some(code) => TwoFactorCallbackResponse::SubmitCode(code),
+                Ok(match tf(prompt.clone()).await {
+                    Some(answer) => two_factor_response(&prompt, &answer),
                     None => TwoFactorCallbackResponse::Abort,
                 })
             }
@@ -341,11 +417,33 @@ async fn sign_in(
     Ok((sideloader, team.team_id))
 }
 
-async fn push_to_app(provider: &WithPairing, bundle_id: &str, bytes: &[u8]) -> Result<(), String> {
-    let ha = HouseArrestClient::connect(provider)
+async fn push_to_app(
+    provider: &WithPairing,
+    pairing: &PairingFile,
+    bundle_id: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
+    // Starting house_arrest with the escrow bag lets it write data-protected
+    // files even if the phone locks.
+    let mut lockdown = LockdownClient::connect(provider)
+        .await
+        .map_err(e("lockdown"))?;
+    let legacy = lockdown
+        .start_session(pairing)
+        .await
+        .map_err(e("lockdown session"))?;
+    let (port, ssl) = lockdown
+        .start_service_with_escrow("com.apple.mobile.house_arrest", pairing.escrow_bag.clone())
         .await
         .map_err(e("house_arrest"))?;
-    let mut afc = ha
+    let mut idevice = provider.connect(port).await.map_err(e("house_arrest"))?;
+    if ssl {
+        idevice
+            .start_session(pairing, legacy)
+            .await
+            .map_err(e("house_arrest TLS"))?;
+    }
+    let mut afc = HouseArrestClient::new(idevice)
         .vend_documents(bundle_id)
         .await
         .map_err(|err| format!("{bundle_id} not installed or not file-sharing enabled ({err})"))?;
@@ -361,6 +459,39 @@ async fn push_to_app(provider: &WithPairing, bundle_id: &str, bytes: &[u8]) -> R
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn prompt(unknown: bool) -> TwoFactorPrompt {
+        TwoFactorPrompt {
+            last_error: None,
+            sms: false,
+            unknown,
+            numbers: vec![TrustedPhone {
+                id: 7,
+                last_two: "42".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn maps_two_factor_answers() {
+        use TwoFactorCallbackResponse as R;
+        let p = prompt(false);
+        assert!(matches!(two_factor_response(&p, " 123 456 "), R::SubmitCode(c) if c == "123456"));
+        assert!(matches!(two_factor_response(&p, "sms"), R::SendSms(7)));
+        assert!(matches!(two_factor_response(&p, "sms:9"), R::SendSms(9)));
+        assert!(matches!(
+            two_factor_response(&p, "device"),
+            R::SendToDevices
+        ));
+        assert!(matches!(two_factor_response(&p, "resend"), R::ResendCode));
+        // With no method selected a code would make isideload bail.
+        assert!(matches!(
+            two_factor_response(&prompt(true), "123456"),
+            R::SendToDevices
+        ));
+    }
+
     #[test]
     fn normalizes_apple_id() {
         assert_eq!(

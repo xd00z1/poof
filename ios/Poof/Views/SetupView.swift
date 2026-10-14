@@ -58,7 +58,7 @@ struct SetupView: View {
                         LabeledContent("Re-send every", value: store.refreshSeconds == 0 ? "off" : "\(store.refreshSeconds) s")
                     }
                     Toggle("Restore last spot on launch", isOn: $store.autoResume)
-                    Text("Re-sending detects a dropped connection sooner, at some battery cost. Changes apply on the next connect.")
+                    Text("Re-sending detects a dropped connection sooner, at some battery cost. Changes apply on your next Teleport.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 } header: { Text("Keep-alive") }

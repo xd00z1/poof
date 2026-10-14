@@ -65,6 +65,13 @@ final class AppStore: ObservableObject {
 
     var isReady: Bool { hasPairingFile }
 
+    /// Changes whenever a new pairing file is imported, so the engine restarts
+    /// with it.
+    var pairingStamp: String {
+        let date = (try? FileManager.default.attributesOfItem(atPath: pairingURL.path))?[.modificationDate] as? Date
+        return String(date?.timeIntervalSince1970 ?? 0)
+    }
+
     func rescan() {
         let fm = FileManager.default
         hasPairingFile = fm.fileExists(atPath: pairingURL.path)

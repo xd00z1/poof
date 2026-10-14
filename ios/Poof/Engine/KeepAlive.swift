@@ -1,4 +1,5 @@
 import AVFoundation
+import UIKit
 
 /// Keeps the app (and so the engine's connection) running in the background
 /// by playing silence through an audio session that mixes with other audio.
@@ -39,18 +40,27 @@ final class KeepAlive {
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 
+    /// Restarts playback if something stopped it. iOS doesn't promise an
+    /// interruption-ended notification (a call, Siri, an alarm), so this also
+    /// runs on every other chance we get.
+    func ensurePlaying() {
+        guard let player, !player.isPlaying else { return }
+        try? AVAudioSession.sharedInstance().setActive(true)
+        player.play()
+    }
+
     private func observe() {
         let nc = NotificationCenter.default
-        // A phone call or Siri pauses us; resume when it ends.
-        observers.append(nc.addObserver(
-            forName: AVAudioSession.interruptionNotification, object: nil, queue: .main
-        ) { [weak self] note in
-            guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
-                  AVAudioSession.InterruptionType(rawValue: raw) == .ended
-            else { return }
-            try? AVAudioSession.sharedInstance().setActive(true)
-            self?.player?.play()
-        })
+        let on = { [weak self] (name: Notification.Name) in
+            self?.observers.append(nc.addObserver(forName: name, object: nil, queue: .main) { _ in
+                self?.ensurePlaying()
+            })
+        }
+        on(AVAudioSession.interruptionNotification)
+        on(AVAudioSession.routeChangeNotification)
+        on(AVAudioSession.silenceSecondaryAudioHintNotification)
+        on(UIApplication.didBecomeActiveNotification)
+        on(UIApplication.willEnterForegroundNotification)
         observers.append(nc.addObserver(
             forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main
         ) { [weak self] _ in

@@ -140,15 +140,35 @@ fn setup(rt: &tokio::runtime::Runtime) -> ! {
         }
     });
 
-    let two_factor: setup::TwoFactor = Arc::new(|last_error| {
+    let two_factor: setup::TwoFactor = Arc::new(|p| {
         Box::pin(async move {
-            if let Some(e) = last_error {
+            if let Some(e) = &p.last_error {
                 eprintln!("  {e}");
             }
-            let code = tokio::task::spawn_blocking(|| prompt("Two-factor code (blank to abort): "))
+            let numbers: Vec<String> = p
+                .numbers
+                .iter()
+                .map(|n| format!("sms:{} (••{})", n.id, n.last_two))
+                .collect();
+            let question = if p.unknown {
+                format!(
+                    "Choose how to get a code: device, {} (blank to abort): ",
+                    numbers.join(", ")
+                )
+            } else {
+                format!(
+                    "Code from your {} (or resend, device, sms; blank to abort): ",
+                    if p.sms {
+                        "text message"
+                    } else {
+                        "Apple devices"
+                    }
+                )
+            };
+            let answer = tokio::task::spawn_blocking(move || prompt(&question))
                 .await
                 .unwrap_or_default();
-            (!code.is_empty()).then_some(code)
+            (!answer.is_empty()).then_some(answer)
         })
     });
 

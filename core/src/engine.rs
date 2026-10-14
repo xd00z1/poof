@@ -29,7 +29,7 @@ use idevice::{
 };
 use serde::Serialize;
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::mpsc,
     task::JoinHandle,
     time::{sleep, timeout},
 };
@@ -42,6 +42,30 @@ const OP_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// How often a walked route reports a new position.
 const ROUTE_STEP: Duration = Duration::from_secs(1);
+/// Upload (~16 MB through the VPN) plus Apple's TSS signing round trip.
+const MOUNT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Why a session ended. `fatal` errors are not retried on a timer.
+#[derive(Debug)]
+struct Fail {
+    msg: String,
+    fatal: bool,
+}
+
+impl Fail {
+    fn fatal(msg: impl Into<String>) -> Self {
+        Self {
+            msg: msg.into(),
+            fatal: true,
+        }
+    }
+}
+
+impl From<String> for Fail {
+    fn from(msg: String) -> Self {
+        Self { msg, fatal: false }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -75,6 +99,9 @@ pub enum Phase {
     Active,
     /// Waiting before the next reconnect attempt.
     Retrying,
+    /// Hit an error retrying cannot fix (unsupported iOS, Developer Mode off,
+    /// no disk image). Waits for the next command before trying again.
+    Failed,
     Stopped,
 }
 
@@ -196,18 +223,27 @@ async fn run(cfg: Config, mut rx: mpsc::UnboundedReceiver<Command>, status: Shar
         update(&status, |s| s.phase = Phase::Connecting);
         match session(&cfg, &mut rx, &mut intent, &status).await {
             Ok(Exit::Shutdown) => break,
-            Err(e) => {
-                tracing::warn!("session ended: {e}");
+            Err(Fail { msg, fatal }) => {
+                tracing::warn!("session ended: {msg}");
                 let was_active = status.lock().unwrap().phase == Phase::Active;
                 if was_active {
                     backoff = Duration::from_secs(1);
                 }
                 update(&status, |s| {
-                    s.last_error = Some(e);
+                    s.last_error = Some(msg);
                     s.reconnects += 1;
-                    s.phase = Phase::Retrying;
+                    s.phase = if fatal {
+                        Phase::Failed
+                    } else {
+                        Phase::Retrying
+                    };
                     s.transport = None;
                 });
+                if fatal {
+                    // Retrying on a timer would fail the same way; wait for
+                    // the user to fix things and ask again.
+                    backoff = Duration::from_secs(24 * 3600);
+                }
             }
         }
 
@@ -262,22 +298,36 @@ impl Drop for AbortOnDrop {
     }
 }
 
-fn spawn_heartbeat(mut hb: HeartbeatClient) -> (AbortOnDrop, oneshot::Receiver<String>) {
-    let (dead_tx, dead_rx) = oneshot::channel();
+/// Answers lockdownd's heartbeat for as long as the session lives. A failed
+/// heartbeat (including the device announcing sleep) only reconnects the
+/// heartbeat itself: tearing down the instruments connection over it would
+/// revert the location on iOS 17+. A connection that is really dead shows up
+/// as a failed location re-send instead.
+fn spawn_heartbeat(mut hb: HeartbeatClient, provider: TcpProvider) -> AbortOnDrop {
     let task = tokio::spawn(async move {
-        let mut interval = 15u64;
-        let reason = loop {
-            match hb.get_marco(interval + 15).await {
-                Ok(next) => interval = next.max(1),
-                Err(e) => break format!("heartbeat: {e}"),
+        loop {
+            let mut interval = 15u64;
+            loop {
+                match hb.get_marco(interval + 15).await {
+                    Ok(next) => interval = next.max(1),
+                    Err(e) => {
+                        tracing::info!("heartbeat ended: {e}");
+                        break;
+                    }
+                }
+                if hb.send_polo().await.is_err() {
+                    break;
+                }
             }
-            if let Err(e) = hb.send_polo().await {
-                break format!("heartbeat: {e}");
-            }
-        };
-        let _ = dead_tx.send(reason);
+            hb = loop {
+                sleep(Duration::from_secs(5)).await;
+                if let Ok(Ok(h)) = timeout(OP_TIMEOUT, HeartbeatClient::connect(&provider)).await {
+                    break h;
+                }
+            };
+        }
     });
-    (AbortOnDrop(task), dead_rx)
+    AbortOnDrop(task)
 }
 
 fn major_version(v: &str) -> u32 {
@@ -291,7 +341,6 @@ fn major_version(v: &str) -> u32 {
 struct Link {
     transport: Transport,
     _heartbeat: AbortOnDrop,
-    heartbeat_dead: oneshot::Receiver<String>,
 }
 
 enum Transport {
@@ -318,7 +367,7 @@ async fn session(
     rx: &mut mpsc::UnboundedReceiver<Command>,
     intent: &mut Intent,
     status: &Shared,
-) -> Result<Exit, String> {
+) -> Result<Exit, Fail> {
     // Connecting can take tens of seconds (or hang until OP_TIMEOUT); keep
     // accepting commands meanwhile so the UI reflects the latest target.
     let connecting = connect(cfg, status);
@@ -339,7 +388,6 @@ async fn session(
     let Link {
         transport,
         _heartbeat,
-        mut heartbeat_dead,
     } = link;
     match transport {
         Transport::Tunnel {
@@ -352,34 +400,22 @@ async fn session(
             )
             .await?;
             update(status, |s| s.transport = Some("tunnel"));
-            drive(
-                Spoofer::Tunnel(client),
-                cfg,
-                rx,
-                intent,
-                status,
-                &mut heartbeat_dead,
-            )
-            .await
+            drive(Spoofer::Tunnel(client), cfg, rx, intent, status)
+                .await
+                .map_err(Fail::from)
         }
         Transport::Legacy(client) => {
             update(status, |s| s.transport = Some("legacy"));
-            drive(
-                Spoofer::Legacy(client),
-                cfg,
-                rx,
-                intent,
-                status,
-                &mut heartbeat_dead,
-            )
-            .await
+            drive(Spoofer::Legacy(client), cfg, rx, intent, status)
+                .await
+                .map_err(Fail::from)
         }
     }
 }
 
-async fn connect(cfg: &Config, status: &Shared) -> Result<Link, String> {
+async fn connect(cfg: &Config, status: &Shared) -> Result<Link, Fail> {
     let pairing_file = PairingFile::read_from_file(&cfg.pairing_file)
-        .map_err(err("could not read pairing file"))?;
+        .map_err(|e| Fail::fatal(format!("could not read pairing file: {e}")))?;
     let provider = TcpProvider {
         addr: cfg.device_ip,
         scope_id: None,
@@ -405,13 +441,21 @@ async fn connect(cfg: &Config, status: &Shared) -> Result<Link, String> {
 
     // Without a heartbeat responder lockdownd tears down the services we open.
     let hb = timed("heartbeat connect", HeartbeatClient::connect(&provider)).await?;
-    let (heartbeat, heartbeat_dead) = spawn_heartbeat(hb);
+    let heartbeat = spawn_heartbeat(
+        hb,
+        TcpProvider {
+            addr: provider.addr,
+            scope_id: provider.scope_id,
+            pairing_file: provider.pairing_file.clone(),
+            label: provider.label.clone(),
+        },
+    );
 
     let transport = if major_version(&version) >= 17 {
         if !has_lockdown_tunnel(&version) {
-            return Err(format!(
+            return Err(Fail::fatal(format!(
                 "iOS {version} is not supported; update to iOS 17.4 or later"
-            ));
+            )));
         }
         ensure_ddi(cfg, &provider, &mut lockdown, status).await?;
         drop(lockdown);
@@ -424,7 +468,7 @@ async fn connect(cfg: &Config, status: &Shared) -> Result<Link, String> {
             .to_async_handle();
         let rsd_stream = match timeout(OP_TIMEOUT, tunnel.connect(rsd_port)).await {
             Ok(r) => r.map_err(|e| format!("RSD connect: {e}"))?,
-            Err(_) => return Err("RSD connect: timed out".into()),
+            Err(_) => return Err(Fail::from("RSD connect: timed out".to_string())),
         };
         let mut rsd = timed("RSD handshake", RsdHandshake::new(rsd_stream)).await?;
         let instruments = timed(
@@ -450,7 +494,6 @@ async fn connect(cfg: &Config, status: &Shared) -> Result<Link, String> {
     Ok(Link {
         transport,
         _heartbeat: heartbeat,
-        heartbeat_dead,
     })
 }
 
@@ -472,30 +515,36 @@ async fn ensure_ddi(
     provider: &TcpProvider,
     lockdown: &mut LockdownClient,
     status: &Shared,
-) -> Result<(), String> {
+) -> Result<(), Fail> {
     let mut mounter = timed("image mounter", ImageMounter::connect(provider)).await?;
 
-    if let Ok(false) = timed("developer mode", mounter.query_developer_mode_status()).await {
-        return Err(
-            "Developer Mode is off (Settings > Privacy & Security > Developer Mode)".into(),
-        );
+    // A timed-out request leaves its reply unread on this connection, so any
+    // failure here must end the session rather than carry on and misread it.
+    if !timed("developer mode", mounter.query_developer_mode_status()).await? {
+        return Err(Fail::fatal(
+            "Developer Mode is off (Settings > Privacy & Security > Developer Mode)",
+        ));
     }
 
-    match timed("lookup image", mounter.lookup_image("Personalized")).await {
-        Ok(_) => return Ok(()),
-        Err(e) if e.contains("timed out") => return Err(e),
-        Err(_) => {} // not mounted
+    match timeout(OP_TIMEOUT, mounter.lookup_image("Personalized")).await {
+        Ok(Ok(_)) => return Ok(()),
+        Ok(Err(IdeviceError::NotFound)) => {} // not mounted
+        Ok(Err(e)) => return Err(format!("lookup image: {e}").into()),
+        Err(_) => return Err("lookup image: timed out".to_string().into()),
     }
 
-    let dir = cfg
-        .ddi_dir
-        .as_deref()
-        .ok_or("developer disk image is not mounted and no DDI directory was given".to_string())?;
+    let dir = cfg.ddi_dir.as_deref().ok_or_else(|| {
+        Fail::fatal("developer disk image is not mounted: download it in Poof > Setup")
+    })?;
     update(status, |s| s.phase = Phase::MountingDdi);
 
-    let read = |name: &str| -> Result<Vec<u8>, String> {
-        std::fs::read(dir.join(name))
-            .map_err(|e| format!("read {}: {e}", Path::new(name).display()))
+    let read = |name: &str| -> Result<Vec<u8>, Fail> {
+        std::fs::read(dir.join(name)).map_err(|e| {
+            Fail::fatal(format!(
+                "read {}: {e} (download the disk image again in Setup)",
+                Path::new(name).display()
+            ))
+        })
     };
     let image = read("Image.dmg")?;
     let trust_cache = read("Image.dmg.trustcache")?;
@@ -507,13 +556,19 @@ async fn ensure_ddi(
     )
     .await?
     .as_unsigned_integer()
-    .ok_or("UniqueChipID missing")?;
+    .ok_or_else(|| "UniqueChipID missing".to_string())?;
 
-    // Upload + TSS signing can take a while on a slow link; no OP_TIMEOUT here.
-    mounter
-        .mount_personalized(provider, image, trust_cache, &manifest, None, chip_id)
-        .await
-        .map_err(err("mount developer disk image"))?;
+    // Upload plus TSS signing is slow, but not unbounded: a stalled link must
+    // fall back into the retry loop instead of sitting in MountingDdi.
+    match timeout(
+        MOUNT_TIMEOUT,
+        mounter.mount_personalized(provider, image, trust_cache, &manifest, None, chip_id),
+    )
+    .await
+    {
+        Ok(r) => r.map_err(err("mount developer disk image"))?,
+        Err(_) => return Err("mount developer disk image: timed out".to_string().into()),
+    }
     update(status, |s| s.phase = Phase::Connecting);
     Ok(())
 }
@@ -548,7 +603,6 @@ async fn drive(
     rx: &mut mpsc::UnboundedReceiver<Command>,
     intent: &mut Intent,
     status: &Shared,
-    hb_dead: &mut oneshot::Receiver<String>,
 ) -> Result<Exit, String> {
     let ack = |status: &Shared| update(status, |s| s.last_ack = Some(now_unix()));
 
@@ -603,9 +657,6 @@ async fn drive(
                     sp.set(c).await?;
                     ack(status);
                 }
-            }
-            reason = &mut *hb_dead => {
-                return Err(reason.unwrap_or_else(|_| "heartbeat stopped".into()));
             }
         }
     }
