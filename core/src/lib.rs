@@ -9,6 +9,8 @@ pub mod engine;
 pub mod geo;
 #[cfg(feature = "desktop")]
 pub mod setup;
+#[cfg(feature = "desktop")]
+pub mod setup_ffi;
 
 use std::{
     ffi::{CStr, CString, c_char},
@@ -24,7 +26,7 @@ pub const POOF_ERR_ARG: i32 = -1;
 pub const POOF_ERR_NOT_RUNNING: i32 = -2;
 pub const POOF_ERR_RUNTIME: i32 = -3;
 
-fn runtime() -> Option<&'static tokio::runtime::Runtime> {
+pub(crate) fn runtime() -> Option<&'static tokio::runtime::Runtime> {
     static RT: OnceLock<Option<tokio::runtime::Runtime>> = OnceLock::new();
     RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
@@ -41,7 +43,7 @@ static ENGINE: Mutex<Option<Engine>> = Mutex::new(None);
 
 /// # Safety
 /// `p` must be null or a valid NUL-terminated string.
-unsafe fn str_arg<'a>(p: *const c_char) -> Option<&'a str> {
+pub(crate) unsafe fn str_arg<'a>(p: *const c_char) -> Option<&'a str> {
     if p.is_null() {
         return None;
     }

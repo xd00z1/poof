@@ -25,20 +25,28 @@ Poof.app ──TCP──> 10.7.0.1 (loopback VPN, e.g. LocalDevVPN) ──> lock
 
 ## Setup (once, on a Mac, iPhone plugged in)
 
-1. Install Poof on the iPhone (sign the IPA with SideStore, AltStore, Sideloadly or Xcode).
-2. On the Mac, run the setup tool (from the `poof-macos-arm64` CI artifact, or `cd core && cargo run --release -- setup`):
+1. Download **Poof Setup** for Mac (`Poof-Setup-mac` CI artifact), unzip it, and open it. It isn't notarized, so the first time, right-click › Open, or run `xattr -dr com.apple.quarantine "Poof Setup.app"`.
+2. Plug in the iPhone, unlock it, enter your Apple ID and press **Install Poof**:
+   - it signs the bundled Poof.ipa with your Apple ID and installs it (via [isideload](https://crates.io/crates/isideload), the engine behind iloader), asking for your 2FA code if Apple wants one;
+   - it creates a pairing that belongs to Poof only (tap **Trust** on the phone) and turns on network lockdown access (`EnableWifiDebugging`), so that pairing works away from the Mac and USB;
+   - it shows the Developer Mode switch in Settings if Developer Mode is off;
+   - it copies the pairing file straight into Poof.
+3. On the iPhone:
+   - trust your Apple ID under Settings › General › VPN & Device Management;
+   - turn on Developer Mode if setup asked you to;
+   - install **LocalDevVPN** from the App Store and turn it on;
+   - in Poof › Setup, download the developer disk image (once).
 
-   ```sh
-   ./poof setup
-   ```
+After that the Mac is out of the picture. On Wi-Fi or cellular, the traffic loops back inside the phone: Poof → VPN → 10.7.0.1 → the phone's own lockdownd.
 
-   - Unlock the phone and tap **Trust**. This creates a pairing that belongs to Poof only.
-   - It turns on network lockdown access (`EnableWifiDebugging`), so the pairing keeps working away from the Mac and USB.
-   - If Developer Mode is off, it makes the switch visible: Settings › Privacy & Security › Developer Mode. Turn it on and let the phone restart.
-   - It copies the pairing file straight into Poof. If Poof isn't installed yet, it saves `poof.mobiledevicepairing` for you to AirDrop.
-3. On the phone, install **LocalDevVPN** and turn it on. In Poof, open Setup and tap **Download** under Developer disk image (once, about 20 MB).
+**Things that make you come back to the Mac:**
+- **Free Apple ID:** the signature expires after **7 days**, and then Poof won't open. Plug in and press Install again to refresh. The pairing survives. A paid developer account lasts a year.
+- **Reset Location & Privacy, erasing the phone, or untrusting computers:** run setup again.
+- **A reboot doesn't need the Mac.** Turn LocalDevVPN back on and open Poof.
 
-After that the Mac is out of the picture. On Wi-Fi or cellular, the traffic loops back inside the phone: Poof → VPN → 10.7.0.1 → the phone's own lockdownd. The pairing lasts until **Reset Location & Privacy**, an erase, or a manual untrust. After a reboot, turn LocalDevVPN back on and open Poof; it re-mounts the disk image and restores the last spot.
+The CLI does the same steps: `poof setup --install Poof.ipa --apple-id you@example.com`.
+
+**Your Apple ID:** the password goes only to Apple. Apple's sign-in also needs "anisette" device headers, which isideload fetches from a public anisette server, the same way SideStore and iloader do. Use a secondary Apple ID if that bothers you. The development certificate and its key are kept in `~/Library/Application Support/Poof/signing` so refreshes reuse them.
 
 ## Building
 
@@ -70,7 +78,8 @@ quit
 | `core/src/engine.rs` | Connect, DDI mount, heartbeat, re-send, reconnect state machine |
 | `core/src/geo.rs` | Coordinates, haversine, route movement |
 | `core/src/lib.rs`, `core/include/poof.h` | C ABI the app links |
-| `core/src/setup.rs` | One-time USB setup (pair, network lockdown, Developer Mode, push to app) |
+| `core/src/setup.rs`, `core/src/setup_ffi.rs` | One-time USB setup: sign + install, pair, network lockdown, Developer Mode, push to app |
+| `mac/` | Poof Setup, the Mac app (SwiftUI) with the Install button |
 | `core/src/bin/poof.rs` | Desktop CLI (`setup` + engine driver) |
 | `ios/` | SwiftUI app (XcodeGen `project.yml`) |
 

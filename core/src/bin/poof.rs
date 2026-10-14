@@ -2,7 +2,8 @@
 //!
 //! One-time setup, iPhone plugged in over USB:
 //!
-//!   poof setup [--udid <udid>] [--out <file>]
+//!   poof setup --install Poof.ipa [--apple-id <email>]   # sign, install, pair
+//!   poof setup                                         # pair only (Poof already installed)
 //!
 //! Spoofing from a computer with the same engine the app embeds (useful for
 //! testing a pairing file before touching the app):
@@ -17,17 +18,27 @@
 use std::{
     io::{BufRead, Write},
     path::PathBuf,
+    sync::Arc,
     time::Duration,
 };
 
 use poof_core::{
     engine::{Command, Config, Engine, Phase},
     geo::{Coord, Mover, Route},
+    setup,
 };
+
+fn prompt(msg: &str) -> String {
+    print!("{msg}");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+    line.trim().to_string()
+}
 
 fn usage() -> ! {
     eprintln!(
-        "usage: poof setup [--udid <udid>] [--out <file>]\n       poof --pairing <file> --ip <device-ip> [--ddi <dir>] [--refresh <secs>]"
+        "usage: poof setup [--install Poof.ipa [--apple-id <email>] [--revoke-certs]] [--udid <udid>] [--out <file>]\n       poof --pairing <file> --ip <device-ip> [--ddi <dir>] [--refresh <secs>]"
     );
     std::process::exit(2);
 }
@@ -100,21 +111,52 @@ fn parse_line(line: &str) -> Result<Option<Command>, String> {
 fn setup(rt: &tokio::runtime::Runtime) -> ! {
     let mut args = std::env::args().skip(2);
     let (mut udid, mut out) = (None, PathBuf::from("poof.mobiledevicepairing"));
+    let (mut ipa, mut apple_id, mut revoke_certs) = (None, None, false);
     while let Some(a) = args.next() {
         let mut val = || args.next().unwrap_or_else(|| usage());
         match a.as_str() {
             "--udid" => udid = Some(val()),
             "--out" => out = PathBuf::from(val()),
+            "--install" => ipa = Some(PathBuf::from(val())),
+            "--apple-id" => apple_id = Some(val()),
+            "--revoke-certs" => revoke_certs = true,
             _ => usage(),
         }
     }
 
-    let res = rt.block_on(poof_core::setup::run(
-        udid.as_deref(),
-        &out,
-        poof_core::setup::APP_BUNDLE_ID,
-        |m| println!("• {m}"),
-    ));
+    let install = ipa.map(|ipa| {
+        let apple_id = apple_id.unwrap_or_else(|| prompt("Apple ID email: "));
+        let password = std::env::var("POOF_APPLE_PASSWORD").unwrap_or_else(|_| {
+            rpassword::prompt_password("Apple ID password: ").unwrap_or_else(|_| usage())
+        });
+        setup::Install {
+            ipa,
+            apple_id,
+            password,
+            state_dir: setup::default_state_dir(),
+            revoke_certs,
+        }
+    });
+
+    let two_factor: setup::TwoFactor = Arc::new(|last_error| {
+        Box::pin(async move {
+            if let Some(e) = last_error {
+                eprintln!("  {e}");
+            }
+            let code = tokio::task::spawn_blocking(|| prompt("Two-factor code (blank to abort): "))
+                .await
+                .unwrap_or_default();
+            (!code.is_empty()).then_some(code)
+        })
+    });
+
+    let res = rt.block_on(setup::run(setup::Options {
+        udid,
+        out: out.clone(),
+        install,
+        two_factor,
+        log: Arc::new(|m| println!("• {m}")),
+    }));
     let report = match res {
         Ok(r) => r,
         Err(e) => {
@@ -132,7 +174,12 @@ fn setup(rt: &tokio::runtime::Runtime) -> ! {
     }
     match &report.app_push_error {
         None => {
-            println!("✓ Poof has its pairing file. Open it, connect LocalDevVPN, and you're done.")
+            println!("✓ Poof has its pairing file. Open it, connect LocalDevVPN, and you're done.");
+            if report.installed {
+                println!(
+                    "  First launch: Settings > General > VPN & Device Management > trust your Apple ID."
+                );
+            }
         }
         Some(e) => {
             println!("! Could not copy into Poof: {e}");

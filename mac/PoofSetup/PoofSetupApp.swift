@@ -1,0 +1,100 @@
+import AppKit
+import SwiftUI
+
+@main
+struct PoofSetupApp: App {
+    var body: some Scene {
+        WindowGroup("Poof Setup") {
+            SetupView()
+                .frame(minWidth: 460, minHeight: 600)
+        }
+        .windowResizability(.contentSize)
+    }
+}
+
+/// Mirror of `setup_ffi::State` in poof-core.
+struct SetupStatus: Decodable {
+    struct Report: Decodable {
+        var udid: String
+        var iosVersion: String
+        var developerMode: Bool
+        var installed: Bool
+        var appPushError: String?
+    }
+
+    var running = false
+    var log: [String] = []
+    var needsCode = false
+    var codeError: String?
+    var report: Report?
+    var error: String?
+}
+
+@MainActor
+final class SetupModel: ObservableObject {
+    @Published var status = SetupStatus()
+    @Published var devices: [String] = []
+    @Published var startError: String?
+
+    private var timer: Timer?
+    private var tick = 0
+    private let decoder: JSONDecoder = {
+        let d = JSONDecoder()
+        d.keyDecodingStrategy = .convertFromSnakeCase
+        return d
+    }()
+
+    /// Poof.ipa shipped inside this app.
+    var bundledIPA: URL? { Bundle.main.url(forResource: "Poof", withExtension: "ipa") }
+
+    var pairingOut: URL {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Poof", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("poof.mobiledevicepairing")
+    }
+
+    func startPolling() {
+        guard timer == nil else { return }
+        refreshDevices()
+        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.poll() }
+        }
+    }
+
+    private func poll() {
+        if let p = poof_setup_status_json() {
+            defer { poof_string_free(p) }
+            if let s = try? decoder.decode(SetupStatus.self, from: Data(String(cString: p).utf8)) {
+                status = s
+            }
+        }
+        tick += 1
+        // usbmuxd query can take a moment; check devices every 2 s while idle.
+        if tick % 4 == 0, !status.running { refreshDevices() }
+    }
+
+    private func refreshDevices() {
+        guard let p = poof_usb_devices_json() else { return }
+        defer { poof_string_free(p) }
+        devices = (try? JSONDecoder().decode([String].self, from: Data(String(cString: p).utf8))) ?? []
+    }
+
+    func install(appleID: String, password: String, ipa: URL, revoke: Bool) {
+        let rc = poof_setup_start(appleID, password, ipa.path, pairingOut.path, revoke)
+        startError = rc == POOF_OK ? nil : "Could not start (\(rc))."
+    }
+
+    func pairOnly() {
+        let rc = poof_setup_start(nil, nil, nil, pairingOut.path, false)
+        startError = rc == POOF_OK ? nil : "Could not start (\(rc))."
+    }
+
+    func submit(code: String?) {
+        if let code {
+            _ = poof_setup_submit_code(code)
+        } else {
+            _ = poof_setup_submit_code(nil)
+        }
+    }
+}

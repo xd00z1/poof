@@ -24,6 +24,9 @@ desktop = [
     "idevice/amfi",
     "idevice/house_arrest",
     "dep:uuid",
+    "dep:isideload",
+    "dep:rustls",
+    "dep:rpassword",
 ]
 
 [dependencies]
@@ -45,6 +48,9 @@ serde_json = "1"
 plist = "1.8"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"], optional = true }
+isideload = { version = "=0.4.5", default-features = false, features = ["install", "tokio-mt", "fs-storage"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+rpassword = { version = "7", optional = true }
 
 [profile.release]
 opt-level = "z"
