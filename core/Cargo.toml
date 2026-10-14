@@ -12,6 +12,19 @@ crate-type = ["staticlib", "rlib"]
 [[bin]]
 name = "poof"
 path = "src/bin/poof.rs"
+required-features = ["desktop"]
+
+[features]
+default = ["desktop"]
+# USB setup from a Mac/PC (pairing, Developer Mode, pushing the pairing file
+# into the app). The iOS library is built with --no-default-features.
+desktop = [
+    "idevice/usbmuxd",
+    "idevice/pair",
+    "idevice/amfi",
+    "idevice/house_arrest",
+    "dep:uuid",
+]
 
 [dependencies]
 idevice = { version = "=0.1.68", default-features = false, features = [
@@ -31,6 +44,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 plist = "1.8"
 tracing = "0.1"
+uuid = { version = "1", features = ["v4"], optional = true }
 
 [profile.release]
 opt-level = "z"

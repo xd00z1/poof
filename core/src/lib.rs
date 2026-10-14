@@ -7,6 +7,8 @@
 
 pub mod engine;
 pub mod geo;
+#[cfg(feature = "desktop")]
+pub mod setup;
 
 use std::{
     ffi::{CStr, CString, c_char},

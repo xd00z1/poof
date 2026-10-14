@@ -1,6 +1,11 @@
-//! Desktop driver for the same engine the iOS app embeds. Useful for testing a
-//! pairing file and the device's services before touching the app, or for
-//! spoofing from a Mac/PC on the same network.
+//! Desktop companion to the iOS app.
+//!
+//! One-time setup, iPhone plugged in over USB:
+//!
+//!   poof setup [--udid <udid>] [--out <file>]
+//!
+//! Spoofing from a computer with the same engine the app embeds (useful for
+//! testing a pairing file before touching the app):
 //!
 //!   poof --pairing <file> --ip <device-ip> [--ddi <dir>] [--refresh <secs>]
 //!
@@ -21,7 +26,9 @@ use poof_core::{
 };
 
 fn usage() -> ! {
-    eprintln!("usage: poof --pairing <file> --ip <device-ip> [--ddi <dir>] [--refresh <secs>]");
+    eprintln!(
+        "usage: poof setup [--udid <udid>] [--out <file>]\n       poof --pairing <file> --ip <device-ip> [--ddi <dir>] [--refresh <secs>]"
+    );
     std::process::exit(2);
 }
 
@@ -90,12 +97,64 @@ fn parse_line(line: &str) -> Result<Option<Command>, String> {
     }
 }
 
+fn setup(rt: &tokio::runtime::Runtime) -> ! {
+    let mut args = std::env::args().skip(2);
+    let (mut udid, mut out) = (None, PathBuf::from("poof.mobiledevicepairing"));
+    while let Some(a) = args.next() {
+        let mut val = || args.next().unwrap_or_else(|| usage());
+        match a.as_str() {
+            "--udid" => udid = Some(val()),
+            "--out" => out = PathBuf::from(val()),
+            _ => usage(),
+        }
+    }
+
+    let res = rt.block_on(poof_core::setup::run(
+        udid.as_deref(),
+        &out,
+        poof_core::setup::APP_BUNDLE_ID,
+        |m| println!("• {m}"),
+    ));
+    let report = match res {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("setup failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    println!();
+    if !report.developer_mode {
+        println!("! Developer Mode is off. Its switch is now visible in");
+        println!(
+            "  Settings > Privacy & Security > Developer Mode. Turn it on; the phone restarts."
+        );
+    }
+    match &report.app_push_error {
+        None => {
+            println!("✓ Poof has its pairing file. Open it, connect LocalDevVPN, and you're done.")
+        }
+        Some(e) => {
+            println!("! Could not copy into Poof: {e}");
+            println!(
+                "  Install Poof, then run setup again, or AirDrop {} to the phone.",
+                out.display()
+            );
+        }
+    }
+    println!("  The pairing stays valid until you 'Reset Location & Privacy' or erase the phone.");
+    std::process::exit(0);
+}
+
 fn main() {
-    let cfg = parse_args();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("tokio runtime");
+    if std::env::args().nth(1).as_deref() == Some("setup") {
+        setup(&rt);
+    }
+    let cfg = parse_args();
     let engine = Engine::spawn(rt.handle(), cfg);
 
     let stdin = std::io::stdin();
