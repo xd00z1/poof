@@ -1,0 +1,60 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: core
+      - run: cargo test
+        working-directory: core
+
+  ios:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+      - name: Build Rust core for iOS
+        run: cargo build --release --lib --target aarch64-apple-ios
+        working-directory: core
+        env:
+          IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+      - name: Generate Xcode project
+        run: |
+          brew install xcodegen
+          xcodegen generate
+        working-directory: ios
+      - name: Build unsigned app
+        run: |
+          xcodebuild -project Poof.xcodeproj -scheme Poof -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            CONFIGURATION_BUILD_DIR="$PWD/build" build
+        working-directory: ios
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/Poof.app Payload/
+          zip -qry Poof.ipa Payload
+        working-directory: ios
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Poof-unsigned-ipa
+          path: ios/Poof.ipa

@@ -1,0 +1,6 @@
+/core/target/
+/ios/Poof.xcodeproj/
+/ios/build/
+/ios/Payload/
+*.ipa
+.DS_Store

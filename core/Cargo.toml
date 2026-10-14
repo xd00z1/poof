@@ -1,0 +1,40 @@
+[package]
+name = "poof-core"
+version = "0.1.0"
+edition = "2024"
+description = "Keep-alive location simulation engine for iOS devices (Apple's DVT LocationSimulation service)"
+license = "MIT"
+
+[lib]
+name = "poof_core"
+crate-type = ["staticlib", "rlib"]
+
+[[bin]]
+name = "poof"
+path = "src/bin/poof.rs"
+
+[dependencies]
+idevice = { version = "=0.1.68", default-features = false, features = [
+    "ring",
+    "tcp",
+    "core_device_proxy",
+    "tunnel_tcp_stack",
+    "rsd",
+    "dvt",
+    "location_simulation",
+    "heartbeat",
+    "mobile_image_mounter",
+    "tss",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+plist = "1.8"
+tracing = "0.1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
