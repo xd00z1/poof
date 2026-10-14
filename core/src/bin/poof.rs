@@ -38,7 +38,7 @@ fn prompt(msg: &str) -> String {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: poof setup [--install Poof.ipa [--apple-id <email>] [--revoke-certs]] [--udid <udid>] [--out <file>]\n       poof --pairing <file> --ip <device-ip> [--ddi <dir>] [--refresh <secs>]"
+        "usage: poof setup [--install Poof.ipa [--apple-id <email>] [--revoke-certs] [--anisette <url>]] [--udid <udid>] [--out <file>]\n       poof --pairing <file> --ip <device-ip> [--ddi <dir>] [--refresh <secs>]"
     );
     std::process::exit(2);
 }
@@ -111,7 +111,7 @@ fn parse_line(line: &str) -> Result<Option<Command>, String> {
 fn setup(rt: &tokio::runtime::Runtime) -> ! {
     let mut args = std::env::args().skip(2);
     let (mut udid, mut out) = (None, PathBuf::from("poof.mobiledevicepairing"));
-    let (mut ipa, mut apple_id, mut revoke_certs) = (None, None, false);
+    let (mut ipa, mut apple_id, mut revoke_certs, mut anisette_url) = (None, None, false, None);
     while let Some(a) = args.next() {
         let mut val = || args.next().unwrap_or_else(|| usage());
         match a.as_str() {
@@ -120,6 +120,7 @@ fn setup(rt: &tokio::runtime::Runtime) -> ! {
             "--install" => ipa = Some(PathBuf::from(val())),
             "--apple-id" => apple_id = Some(val()),
             "--revoke-certs" => revoke_certs = true,
+            "--anisette" => anisette_url = Some(val()),
             _ => usage(),
         }
     }
@@ -135,6 +136,7 @@ fn setup(rt: &tokio::runtime::Runtime) -> ! {
             password,
             state_dir: setup::default_state_dir(),
             revoke_certs,
+            anisette_url,
         }
     });
 

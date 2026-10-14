@@ -12,7 +12,7 @@ struct PoofApp: App {
                 .environmentObject(store)
                 .environmentObject(engine)
                 .task { resumeIfNeeded() }
-                .onChange(of: scenePhase) { _, phase in
+                .onChange(of: scenePhase, initial: true) { _, phase in
                     // Poll only while visible; the engine itself keeps running.
                     if phase == .active {
                         store.importFromDocuments()

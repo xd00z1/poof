@@ -80,13 +80,18 @@ final class SetupModel: ObservableObject {
         devices = (try? JSONDecoder().decode([String].self, from: Data(String(cString: p).utf8))) ?? []
     }
 
-    func install(appleID: String, password: String, ipa: URL, revoke: Bool) {
-        let rc = poof_setup_start(appleID, password, ipa.path, pairingOut.path, revoke)
+    func install(appleID: String, password: String, ipa: URL, revoke: Bool, anisette: String?) {
+        let rc: Int32
+        if let anisette, !anisette.isEmpty {
+            rc = poof_setup_start(appleID, password, ipa.path, pairingOut.path, revoke, anisette)
+        } else {
+            rc = poof_setup_start(appleID, password, ipa.path, pairingOut.path, revoke, nil)
+        }
         startError = rc == POOF_OK ? nil : "Could not start (\(rc))."
     }
 
     func pairOnly() {
-        let rc = poof_setup_start(nil, nil, nil, pairingOut.path, false)
+        let rc = poof_setup_start(nil, nil, nil, pairingOut.path, false, nil)
         startError = rc == POOF_OK ? nil : "Could not start (\(rc))."
     }
 

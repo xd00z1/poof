@@ -40,7 +40,7 @@ fn with_state<T>(f: impl FnOnce(&mut State) -> T) -> T {
 
 /// Runs the one-time setup on the first USB iPhone. With a null `apple_id`
 /// it only pairs (Poof already installed); otherwise it also signs and
-/// installs the IPA at `ipa_path`.
+/// installs the IPA at `ipa_path`. `anisette_url` may be null (default server).
 ///
 /// # Safety
 /// String arguments must be null or valid NUL-terminated UTF-8.
@@ -51,6 +51,7 @@ pub unsafe extern "C" fn poof_setup_start(
     ipa_path: *const c_char,
     pairing_out: *const c_char,
     revoke_certs: bool,
+    anisette_url: *const c_char,
 ) -> i32 {
     let Some(out) = (unsafe { str_arg(pairing_out) }) else {
         return POOF_ERR_ARG;
@@ -63,6 +64,7 @@ pub unsafe extern "C" fn poof_setup_start(
             password: pw.to_string(),
             state_dir: setup::default_state_dir(),
             revoke_certs,
+            anisette_url: unsafe { str_arg(anisette_url) }.map(str::to_string),
         }),
         _ => return POOF_ERR_ARG,
     };

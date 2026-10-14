@@ -16,7 +16,7 @@ final class AppStore: ObservableObject {
     /// Source of the personalized developer disk image (the same files Xcode
     /// mounts). Override in Setup if this repository moves.
     static let defaultDDIBase =
-        "https://github.com/doronz88/DeveloperDiskImage/raw/main/PersonalizedImages/Xcode_iOS_DDI_Personalized"
+        "https://raw.githubusercontent.com/doronz88/DeveloperDiskImage/main/PersonalizedImages/Xcode_iOS_DDI_Personalized"
     static let ddiFiles = ["BuildManifest.plist", "Image.dmg", "Image.dmg.trustcache"]
 
     private let defaults = UserDefaults.standard

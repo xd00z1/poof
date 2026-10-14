@@ -10,6 +10,32 @@ struct SetupView: View {
     @State private var revoke = false
     @State private var code = ""
     @State private var customIPA: URL?
+    @AppStorage("anisetteServer") private var anisetteServer = AnisetteServer.defaultServer
+    @AppStorage("anisetteCustom") private var anisetteCustom = ""
+
+    /// Public servers that supply the "anisette" device headers Apple's sign-in
+    /// requires. When one misbehaves Apple answers "wrong password".
+    enum AnisetteServer: String, CaseIterable, Identifiable {
+        case defaultServer = "https://ani.stikstore.app"
+        case sidestore = "https://ani.sidestore.io"
+        case custom = "custom"
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .defaultServer: "StikStore (default)"
+            case .sidestore: "SideStore"
+            case .custom: "Custom…"
+            }
+        }
+    }
+
+    private var anisetteURL: String? {
+        switch anisetteServer {
+        case .defaultServer: nil
+        case .custom: anisetteCustom.trimmingCharacters(in: .whitespaces)
+        default: anisetteServer.rawValue
+        }
+    }
 
     private var ipa: URL? { customIPA ?? model.bundledIPA }
     private var hasDevice: Bool { !model.devices.isEmpty }
@@ -57,6 +83,14 @@ struct SetupView: View {
                     .textContentType(.username)
                 SecureField("Password", text: $password)
                     .textContentType(.password)
+                Picker("Sign-in server", selection: $anisetteServer) {
+                    ForEach(AnisetteServer.allCases) { Text($0.label).tag($0) }
+                }
+                .font(.caption)
+                if anisetteServer == .custom {
+                    TextField("https://anisette.example", text: $anisetteCustom)
+                        .font(.caption.monospaced())
+                }
                 Toggle("If the certificate limit is hit, revoke old development certificates", isOn: $revoke)
                     .font(.caption)
                 Text("Used only to sign Poof for your phone, the same way Xcode, AltServer and Sideloadly do. A free Apple ID's signature lasts 7 days; plug in and press Install again to refresh. Your password is not stored.")
@@ -78,7 +112,7 @@ struct SetupView: View {
         HStack {
             Button {
                 guard let ipa else { return }
-                model.install(appleID: appleID, password: password, ipa: ipa, revoke: revoke)
+                model.install(appleID: appleID, password: password, ipa: ipa, revoke: revoke, anisette: anisetteURL)
             } label: {
                 Label("Install Poof", systemImage: "arrow.down.app")
                     .frame(maxWidth: .infinity)

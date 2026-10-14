@@ -34,6 +34,7 @@ fn setup_reports_failure_without_device() {
             std::ptr::null(),
             out.as_ptr(),
             false,
+            std::ptr::null(),
         )
     };
     assert_eq!(rc, POOF_ERR_ARG);
@@ -46,6 +47,7 @@ fn setup_reports_failure_without_device() {
             std::ptr::null(),
             out.as_ptr(),
             false,
+            std::ptr::null(),
         )
     };
     assert_eq!(rc, POOF_OK);

@@ -304,6 +304,15 @@ enum Transport {
     Legacy(LocationSimulationService),
 }
 
+/// CoreDeviceProxy over lockdown (USB or network) first shipped in iOS 17.4;
+/// 17.0–17.3 only offer the QUIC remote-pairing tunnel, which this does not
+/// implement.
+fn has_lockdown_tunnel(v: &str) -> bool {
+    let mut parts = v.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+    let (major, minor) = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
+    major > 17 || (major == 17 && minor >= 4)
+}
+
 async fn session(
     cfg: &Config,
     rx: &mut mpsc::UnboundedReceiver<Command>,
@@ -399,6 +408,11 @@ async fn connect(cfg: &Config, status: &Shared) -> Result<Link, String> {
     let (heartbeat, heartbeat_dead) = spawn_heartbeat(hb);
 
     let transport = if major_version(&version) >= 17 {
+        if !has_lockdown_tunnel(&version) {
+            return Err(format!(
+                "iOS {version} is not supported; update to iOS 17.4 or later"
+            ));
+        }
         ensure_ddi(cfg, &provider, &mut lockdown, status).await?;
         drop(lockdown);
 
@@ -594,5 +608,19 @@ async fn drive(
                 return Err(reason.unwrap_or_else(|_| "heartbeat stopped".into()));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_gates() {
+        assert_eq!(major_version("16.7.10"), 16);
+        assert!(!has_lockdown_tunnel("17.3.1"));
+        assert!(has_lockdown_tunnel("17.4"));
+        assert!(has_lockdown_tunnel("18.0"));
+        assert!(has_lockdown_tunnel("26.1"));
     }
 }

@@ -16,9 +16,10 @@
 
 // Pairs the first USB iPhone, enables network lockdown, and copies the pairing
 // file into Poof. With apple_id non-NULL it first signs and installs ipa_path.
+// anisette_url: NULL for the default anisette server.
 int32_t poof_setup_start(const char *_Nullable apple_id, const char *_Nullable password,
                          const char *_Nullable ipa_path, const char *pairing_out,
-                         bool revoke_certs);
+                         bool revoke_certs, const char *_Nullable anisette_url);
 
 // Answers a pending two-factor prompt; NULL or "" aborts.
 int32_t poof_setup_submit_code(const char *_Nullable code);
