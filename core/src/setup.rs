@@ -233,6 +233,12 @@ pub async fn run(opts: Options) -> Result<Report, String> {
     })
 }
 
+/// Apple IDs are case-insensitive and stored lowercased; email addresses
+/// carry no meaningful surrounding whitespace.
+fn normalize_apple_id(s: &str) -> String {
+    s.trim().to_lowercase()
+}
+
 async fn sideload(
     provider: &WithPairing,
     inst: &Install,
@@ -249,14 +255,17 @@ async fn sideload(
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&inst.state_dir, std::fs::Permissions::from_mode(0o700));
     }
-    log("Signing in to Apple ID");
+    // The email is an input to Apple's SRP proof: a stray space or different
+    // capitalisation (autofill) turns into "Enter the correct password".
+    let apple_id = normalize_apple_id(&inst.apple_id);
+    log(&format!("Signing in to Apple ID {apple_id}"));
     let tf = two_factor.clone();
     // The provider's default storage is the working directory, which is `/`
     // (read-only) for an app opened from Finder.
     let anisette = RemoteV3AnisetteProvider::default()
         .map_err(|r| format!("anisette: {r}"))?
         .set_storage(Box::new(FsStorage::new(inst.state_dir.join("anisette"))));
-    let mut account = AppleAccountBuilder::new(&inst.apple_id)
+    let mut account = AppleAccountBuilder::new(&apple_id)
         .anisette_provider(anisette)
         .login(&inst.password, move |p: TwoFactorCallbackParams| {
             let tf = tf.clone();
@@ -273,16 +282,15 @@ async fn sideload(
         .await
         .map_err(|r| format!("developer session: {r}"))?;
 
-    let mut sideloader =
-        SideloaderBuilder::<MaxCertsCallbackBox>::new(session, inst.apple_id.clone())
-            .machine_name("Poof".into())
-            .storage(Box::new(FsStorage::new(inst.state_dir.clone())))
-            .max_certs_behavior(if inst.revoke_certs {
-                MaxCertsBehavior::Revoke
-            } else {
-                MaxCertsBehavior::Error
-            })
-            .build();
+    let mut sideloader = SideloaderBuilder::<MaxCertsCallbackBox>::new(session, apple_id.clone())
+        .machine_name("Poof".into())
+        .storage(Box::new(FsStorage::new(inst.state_dir.clone())))
+        .max_certs_behavior(if inst.revoke_certs {
+            MaxCertsBehavior::Revoke
+        } else {
+            MaxCertsBehavior::Error
+        })
+        .build();
     let team = sideloader
         .get_team()
         .await
@@ -318,4 +326,15 @@ async fn push_to_app(provider: &WithPairing, bundle_id: &str, bytes: &[u8]) -> R
     f.write_entire(bytes).await.map_err(e("write in app"))?;
     f.close().await.map_err(e("close in app"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn normalizes_apple_id() {
+        assert_eq!(
+            super::normalize_apple_id("  Me@iCloud.com \n"),
+            "me@icloud.com"
+        );
+    }
 }
