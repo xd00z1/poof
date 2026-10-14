@@ -14,6 +14,7 @@
 use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
 
 use isideload::{
+    anisette::remote_v3::RemoteV3AnisetteProvider,
     auth::{
         apple_account::{TwoFactorCallbackParams, TwoFactorCallbackResponse},
         builder::AppleAccountBuilder,
@@ -242,9 +243,21 @@ async fn sideload(
     let _ = rustls::crypto::ring::default_provider().install_default();
     let _ = isideload::init();
 
+    std::fs::create_dir_all(&inst.state_dir).map_err(|err| format!("state dir: {err}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&inst.state_dir, std::fs::Permissions::from_mode(0o700));
+    }
     log("Signing in to Apple ID");
     let tf = two_factor.clone();
+    // The provider's default storage is the working directory, which is `/`
+    // (read-only) for an app opened from Finder.
+    let anisette = RemoteV3AnisetteProvider::default()
+        .map_err(|r| format!("anisette: {r}"))?
+        .set_storage(Box::new(FsStorage::new(inst.state_dir.join("anisette"))));
     let mut account = AppleAccountBuilder::new(&inst.apple_id)
+        .anisette_provider(anisette)
         .login(&inst.password, move |p: TwoFactorCallbackParams| {
             let tf = tf.clone();
             async move {
@@ -260,12 +273,6 @@ async fn sideload(
         .await
         .map_err(|r| format!("developer session: {r}"))?;
 
-    std::fs::create_dir_all(&inst.state_dir).map_err(|err| format!("state dir: {err}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&inst.state_dir, std::fs::Permissions::from_mode(0o700));
-    }
     let mut sideloader =
         SideloaderBuilder::<MaxCertsCallbackBox>::new(session, inst.apple_id.clone())
             .machine_name("Poof".into())
