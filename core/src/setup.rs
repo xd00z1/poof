@@ -387,7 +387,13 @@ async fn sign_in(
         .await
         .map_err(|r| {
             let msg = format!("Apple ID sign-in: {r}");
-            if msg.contains("-22406") {
+            if msg.contains("503") && msg.contains("gsa.apple.com") {
+                format!(
+                    "Apple is temporarily refusing sign-ins (HTTP 503 from gsa.apple.com), \
+                     usually after several failed attempts. Wait at least an hour before \
+                     trying again; each retry can extend the block.\n\n{msg}"
+                )
+            } else if msg.contains("-22406") {
                 format!(
                     "{msg}\nIf this password works at account.apple.com, the anisette server \
                      is the likely cause: pick another one and try again."
