@@ -316,6 +316,21 @@ pub async fn run(opts: Options) -> Result<Report, String> {
     })
 }
 
+/// Filesystem-safe name for a server URL.
+fn storage_key(url: &str) -> String {
+    url.trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Apple IDs are case-insensitive and stored lowercased; email addresses
 /// carry no meaningful surrounding whitespace.
 fn normalize_apple_id(s: &str) -> String {
@@ -345,16 +360,17 @@ async fn sign_in(
 
     // The provider's default storage is the working directory, which is `/`
     // (read-only) for an app opened from Finder.
-    let mut anisette = RemoteV3AnisetteProvider::default()
-        .map_err(|r| format!("anisette: {r}"))?
-        .set_storage(Box::new(FsStorage::new(inst.state_dir.join("anisette"))));
     let server = match inst.anisette_url.as_deref().map(str::trim) {
-        Some(url) if !url.is_empty() => {
-            anisette = anisette.set_url(url);
-            url.to_string()
-        }
+        Some(url) if !url.is_empty() => url.trim_end_matches('/').to_string(),
         _ => DEFAULT_ANISETTE_V3_URL.to_string(),
     };
+    // Each server provisions its own device identity; reusing one server's
+    // saved identity with another gets the sign-in rejected.
+    let anisette_dir = inst.state_dir.join("anisette").join(storage_key(&server));
+    let anisette = RemoteV3AnisetteProvider::default()
+        .map_err(|r| format!("anisette: {r}"))?
+        .set_url(&server)
+        .set_storage(Box::new(FsStorage::new(anisette_dir)));
     log(&format!(
         "Signing in to Apple ID {apple_id} (anisette: {server})"
     ));
@@ -496,6 +512,12 @@ mod tests {
             two_factor_response(&prompt(true), "123456"),
             R::SendToDevices
         ));
+    }
+
+    #[test]
+    fn storage_key_is_path_safe() {
+        assert_eq!(storage_key("https://ani.jkcoxson.com"), "ani.jkcoxson.com");
+        assert!(!storage_key("https://h:8080/a/../b").contains('/'));
     }
 
     #[test]

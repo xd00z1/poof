@@ -10,19 +10,21 @@ struct SetupView: View {
     @State private var revoke = false
     @State private var code = ""
     @State private var customIPA: URL?
-    @AppStorage("anisetteServer") private var anisetteServer = AnisetteServer.defaultServer
+    @AppStorage("anisetteServer2") private var anisetteServer = AnisetteServer.defaultServer
     @AppStorage("anisetteCustom") private var anisetteCustom = ""
 
     /// Public servers that supply the "anisette" device headers Apple's sign-in
     /// requires. When one misbehaves Apple answers "wrong password".
     enum AnisetteServer: String, CaseIterable, Identifiable {
-        case defaultServer = "https://ani.stikstore.app"
+        case defaultServer = "default"
+        case stikstore = "https://ani.stikstore.app"
         case sidestore = "https://ani.sidestore.io"
         case custom = "custom"
         var id: String { rawValue }
         var label: String {
             switch self {
-            case .defaultServer: "StikStore (default)"
+            case .defaultServer: "Default (ani.jkcoxson.com)"
+            case .stikstore: "StikStore"
             case .sidestore: "SideStore"
             case .custom: "Custom…"
             }
