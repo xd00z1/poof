@@ -15,7 +15,7 @@ pub mod setup_ffi;
 use std::{
     ffi::{CStr, CString, c_char},
     path::PathBuf,
-    sync::{Mutex, OnceLock},
+    sync::Mutex,
 };
 
 use engine::{Command, Config, Engine};
@@ -26,8 +26,10 @@ pub const POOF_ERR_ARG: i32 = -1;
 pub const POOF_ERR_NOT_RUNNING: i32 = -2;
 pub const POOF_ERR_RUNTIME: i32 = -3;
 
+/// Runtime for the Mac setup calls; each engine runs its own (see `Engine::spawn`).
+#[cfg(feature = "desktop")]
 pub(crate) fn runtime() -> Option<&'static tokio::runtime::Runtime> {
-    static RT: OnceLock<Option<tokio::runtime::Runtime>> = OnceLock::new();
+    static RT: std::sync::OnceLock<Option<tokio::runtime::Runtime>> = std::sync::OnceLock::new();
     RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -79,9 +81,6 @@ pub unsafe extern "C" fn poof_start(
     let Ok(device_ip) = ip.parse() else {
         return POOF_ERR_ARG;
     };
-    let Some(rt) = runtime() else {
-        return POOF_ERR_RUNTIME;
-    };
     let cfg = Config {
         pairing_file: PathBuf::from(pairing),
         device_ip,
@@ -93,7 +92,7 @@ pub unsafe extern "C" fn poof_start(
     if let Some(old) = slot.take() {
         old.send(Command::Shutdown);
     }
-    *slot = Some(Engine::spawn(rt.handle(), cfg));
+    *slot = Some(Engine::spawn(cfg));
     POOF_OK
 }
 

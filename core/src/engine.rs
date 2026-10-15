@@ -14,21 +14,29 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use std::net::SocketAddr;
+
 use idevice::{
-    IdeviceError, IdeviceService, ReadWrite,
+    IdeviceError, IdeviceService, ReadWrite, RsdService,
     core_device_proxy::CoreDeviceProxy,
+    cryptexd::{self, assets::Cryptex1Assets},
     dvt::{location_simulation::LocationSimulationClient, remote_server::RemoteServerClient},
     heartbeat::HeartbeatClient,
     lockdown::LockdownClient,
     mobile_image_mounter::ImageMounter,
     pairing_file::PairingFile,
     provider::TcpProvider,
+    remote_pairing::{
+        RemotePairingClient, RpPairingFile, RpPairingSocket, connect_tls_psk_tunnel_native,
+    },
     rsd::RsdHandshake,
     simulate_location::LocationSimulationService,
+    tcp::adapter::Adapter,
     tcp::handle::AdapterHandle,
 };
 use serde::Serialize;
 use tokio::{
+    net::TcpStream,
     sync::mpsc,
     task::JoinHandle,
     time::{sleep, timeout},
@@ -137,15 +145,34 @@ impl Default for Status {
 pub struct Engine {
     tx: mpsc::UnboundedSender<Command>,
     status: Arc<Mutex<Status>>,
-    task: JoinHandle<()>,
+    thread: std::thread::JoinHandle<()>,
 }
 
 impl Engine {
-    pub fn spawn(rt: &tokio::runtime::Handle, cfg: Config) -> Self {
+    /// Runs the engine on its own thread with a single-threaded runtime. Some
+    /// idevice futures (the cryptex DDI install) are not `Send`, so they cannot
+    /// run on a work-stealing runtime; the tunnel's TCP stack and the heartbeat
+    /// are spawned onto this same runtime.
+    pub fn spawn(cfg: Config) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let status = Arc::new(Mutex::new(Status::default()));
-        let task = rt.spawn(run(cfg, rx, status.clone()));
-        Self { tx, status, task }
+        let shared = status.clone();
+        let thread = std::thread::Builder::new()
+            .name("poof-engine".into())
+            .spawn(move || {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt.block_on(run(cfg, rx, shared)),
+                    Err(e) => update(&shared, |s| {
+                        s.last_error = Some(format!("runtime: {e}"));
+                        s.phase = Phase::Stopped;
+                    }),
+                }
+            })
+            .expect("spawn engine thread");
+        Self { tx, status, thread }
     }
 
     pub fn send(&self, cmd: Command) -> bool {
@@ -157,7 +184,7 @@ impl Engine {
     }
 
     pub fn is_finished(&self) -> bool {
-        self.task.is_finished()
+        self.thread.is_finished()
     }
 }
 
@@ -340,7 +367,8 @@ fn major_version(v: &str) -> u32 {
 /// A connected session, owned so it can outlive the connect future.
 struct Link {
     transport: Transport,
-    _heartbeat: AbortOnDrop,
+    /// Lockdown sessions need a heartbeat responder; RPPairing tunnels don't.
+    _heartbeat: Option<AbortOnDrop>,
 }
 
 enum Transport {
@@ -413,7 +441,203 @@ async fn session(
     }
 }
 
+/// The RPPairing service, reachable through the loopback VPN like lockdownd.
+const RP_PORT: u16 = 49152;
+/// Name this app presents to the device during pair-verify (StikDebug uses
+/// its own name the same way).
+const RP_HOST: &str = "Poof";
+
+/// iOS 26.4 stopped accepting lockdown pairing records over the network, so a
+/// pairing file that also carries RPPairing keys (written by Poof Setup on
+/// iOS 17.4+) is connected through the RPPairing tunnel, as StikDebug does
+/// since iOS 26.4. Lockdown remains the path for files without those keys.
 async fn connect(cfg: &Config, status: &Shared) -> Result<Link, Fail> {
+    let bytes = std::fs::read(&cfg.pairing_file)
+        .map_err(|e| Fail::fatal(format!("could not read pairing file: {e}")))?;
+    match RpPairingFile::from_bytes(&bytes) {
+        Ok(rp) => connect_rppairing(cfg, rp, status).await,
+        Err(_) => connect_lockdown(cfg, status).await,
+    }
+}
+
+async fn tcp_connect(addr: SocketAddr, what: &str) -> Result<TcpStream, Fail> {
+    match timeout(OP_TIMEOUT, TcpStream::connect(addr)).await {
+        Ok(Ok(s)) => Ok(s),
+        Ok(Err(e)) => Err(format!("{what} {addr}: {e} (is LocalDevVPN connected?)").into()),
+        Err(_) => Err(format!("{what} {addr}: timed out (is LocalDevVPN connected?)").into()),
+    }
+}
+
+async fn connect_rppairing(
+    cfg: &Config,
+    mut rp: RpPairingFile,
+    status: &Shared,
+) -> Result<Link, Fail> {
+    let stream = tcp_connect(SocketAddr::new(cfg.device_ip, RP_PORT), "RPPairing").await?;
+    let mut rpc = RemotePairingClient::new(RpPairingSocket::new(stream), RP_HOST);
+    // A valid pairing file passes pair-verify. If the device has forgotten it,
+    // connect() falls back to pair-setup, which needs a PIN only the Mac flow
+    // can supply, so that case ends here with an error.
+    timed(
+        "RPPairing verify (if this keeps failing, run Pair only in Poof Setup again)",
+        rpc.connect(&mut rp, || async { "000000".to_string() }),
+    )
+    .await?;
+    let port = timed("RPPairing tunnel", rpc.create_tcp_listener()).await?;
+    let tunnel_stream = tcp_connect(SocketAddr::new(cfg.device_ip, port), "tunnel").await?;
+    let tunnel = timed(
+        "TLS-PSK tunnel",
+        connect_tls_psk_tunnel_native(tunnel_stream, rpc.encryption_key()),
+    )
+    .await?;
+    drop(rpc);
+
+    let parse = |a: &str| -> Result<IpAddr, Fail> {
+        a.parse()
+            .map_err(|e| Fail::from(format!("tunnel address {a}: {e}")))
+    };
+    let (client_ip, server_ip) = (
+        parse(&tunnel.info.client_address)?,
+        parse(&tunnel.info.server_address)?,
+    );
+    let mtu = tunnel.info.mtu as usize;
+    let rsd_port = tunnel.info.server_rsd_port;
+    let raw: Box<dyn ReadWrite> = Box::new(tunnel.into_inner());
+    let mut adapter = Adapter::new(Box::new(raw), client_ip, server_ip);
+    adapter.set_mss(mtu.saturating_sub(60));
+    let mut tunnel = adapter.to_async_handle();
+
+    let rsd_stream = match timeout(OP_TIMEOUT, tunnel.connect(rsd_port)).await {
+        Ok(r) => r.map_err(|e| format!("RSD connect: {e}"))?,
+        Err(_) => return Err(Fail::from("RSD connect: timed out".to_string())),
+    };
+    let mut rsd = timed("RSD handshake", RsdHandshake::new(rsd_stream)).await?;
+    if let Some(v) = ["OSVersion", "ProductVersion"]
+        .iter()
+        .find_map(|k| rsd.properties.get(*k).and_then(|v| v.as_string()))
+    {
+        let v = v.to_string();
+        update(status, |s| s.ios_version = Some(v));
+    }
+
+    ensure_ddi_rsd(cfg, &mut tunnel, &mut rsd, status).await?;
+    let instruments = open_instruments(&mut rsd, &mut tunnel).await?;
+    Ok(Link {
+        transport: Transport::Tunnel {
+            _tunnel: tunnel,
+            instruments,
+        },
+        _heartbeat: None,
+    })
+}
+
+/// Connects to the instruments hub and consumes the capabilities message the
+/// device sends first on channel 0; leaving it unread desynchronises the
+/// replies that follow (idevice's own tool and StikDebug read it the same way).
+async fn open_instruments(
+    rsd: &mut RsdHandshake,
+    tunnel: &mut AdapterHandle,
+) -> Result<Instruments, Fail> {
+    let mut instruments = timed("instruments connect", connect_instruments(rsd, tunnel)).await?;
+    timed("instruments greeting", instruments.read_message(0)).await?;
+    Ok(instruments)
+}
+
+/// The DDI over the tunnel: the cryptex install on iOS 26.4+ (the app downloads
+/// the cryptex files there), the personalized mount before that.
+async fn ensure_ddi_rsd(
+    cfg: &Config,
+    tunnel: &mut AdapterHandle,
+    rsd: &mut RsdHandshake,
+    status: &Shared,
+) -> Result<(), Fail> {
+    let mut mounter: ImageMounter =
+        timed("image mounter", ImageMounter::connect_rsd(tunnel, rsd)).await?;
+    if !timed("developer mode", mounter.query_developer_mode_status()).await? {
+        return Err(Fail::fatal(
+            "Developer Mode is off (Settings > Privacy & Security > Developer Mode)",
+        ));
+    }
+
+    let cryptex = cfg
+        .ddi_dir
+        .as_deref()
+        .is_some_and(|d| d.join("Image.dmg.cryptex_info").exists());
+
+    if cryptex {
+        match timeout(OP_TIMEOUT, cryptexd::installed_ddi(tunnel, rsd)).await {
+            Ok(Ok(Some(_))) => return Ok(()),
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => return Err(format!("installed DDI: {e}").into()),
+            Err(_) => return Err("installed DDI: timed out".to_string().into()),
+        }
+    } else {
+        match timeout(OP_TIMEOUT, mounter.lookup_image("Personalized")).await {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(IdeviceError::NotFound)) => {}
+            Ok(Err(e)) => return Err(format!("lookup image: {e}").into()),
+            Err(_) => return Err("lookup image: timed out".to_string().into()),
+        }
+    }
+
+    let dir = cfg.ddi_dir.as_deref().ok_or_else(|| {
+        Fail::fatal("developer disk image is not mounted: download it in Poof > Setup")
+    })?;
+    update(status, |s| s.phase = Phase::MountingDdi);
+
+    if cryptex {
+        let assets = Cryptex1Assets::load(dir).await.map_err(|e| {
+            Fail::fatal(format!(
+                "disk image files: {e} (download the disk image again in Setup)"
+            ))
+        })?;
+        match timeout(MOUNT_TIMEOUT, cryptexd::install_ddi(tunnel, rsd, &assets)).await {
+            Ok(r) => r.map_err(err("install developer disk image"))?,
+            Err(_) => return Err("install developer disk image: timed out".to_string().into()),
+        };
+    } else {
+        let read = |name: &str| -> Result<Vec<u8>, Fail> {
+            std::fs::read(dir.join(name)).map_err(|e| {
+                Fail::fatal(format!(
+                    "read {name}: {e} (download the disk image again in Setup)"
+                ))
+            })
+        };
+        let image = read("Image.dmg")?;
+        let trust_cache = read("Image.dmg.trustcache")?;
+        let manifest = read("BuildManifest.plist")?;
+        let mut lockdown: LockdownClient =
+            timed("lockdown (RSD)", LockdownClient::connect_rsd(tunnel, rsd)).await?;
+        let chip_id = timed(
+            "read UniqueChipID",
+            lockdown.get_value(Some("UniqueChipID"), None),
+        )
+        .await?
+        .as_unsigned_integer()
+        .ok_or_else(|| "UniqueChipID missing".to_string())?;
+        match timeout(
+            MOUNT_TIMEOUT,
+            mounter.mount_personalized_rsd(
+                tunnel,
+                rsd,
+                image,
+                trust_cache,
+                &manifest,
+                None,
+                chip_id,
+            ),
+        )
+        .await
+        {
+            Ok(r) => r.map_err(err("mount developer disk image"))?,
+            Err(_) => return Err("mount developer disk image: timed out".to_string().into()),
+        }
+    }
+    update(status, |s| s.phase = Phase::Connecting);
+    Ok(())
+}
+
+async fn connect_lockdown(cfg: &Config, status: &Shared) -> Result<Link, Fail> {
     let pairing_file = PairingFile::read_from_file(&cfg.pairing_file)
         .map_err(|e| Fail::fatal(format!("could not read pairing file: {e}")))?;
     let provider = TcpProvider {
@@ -471,11 +695,7 @@ async fn connect(cfg: &Config, status: &Shared) -> Result<Link, Fail> {
             Err(_) => return Err(Fail::from("RSD connect: timed out".to_string())),
         };
         let mut rsd = timed("RSD handshake", RsdHandshake::new(rsd_stream)).await?;
-        let instruments = timed(
-            "instruments connect",
-            connect_instruments(&mut rsd, &mut tunnel),
-        )
-        .await?;
+        let instruments = open_instruments(&mut rsd, &mut tunnel).await?;
         Transport::Tunnel {
             _tunnel: tunnel,
             instruments,
@@ -493,7 +713,7 @@ async fn connect(cfg: &Config, status: &Shared) -> Result<Link, Fail> {
 
     Ok(Link {
         transport,
-        _heartbeat: heartbeat,
+        _heartbeat: Some(heartbeat),
     })
 }
 

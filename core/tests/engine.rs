@@ -29,10 +29,7 @@ fn cfg(pairing: PathBuf) -> Config {
 
 #[tokio::test]
 async fn bad_pairing_file_fails_until_asked_again() {
-    let engine = Engine::spawn(
-        &tokio::runtime::Handle::current(),
-        cfg("/nonexistent.plist".into()),
-    );
+    let engine = Engine::spawn(cfg("/nonexistent.plist".into()));
     // Unfixable by waiting: no timer retries, it parks in Failed.
     assert!(wait_for(&engine, |s| s.phase == Phase::Failed).await);
     let st = engine.status();
@@ -73,7 +70,7 @@ async fn commands_apply_while_connect_hangs() {
     let pairing = dir.join("pairing.plist");
     std::fs::write(&pairing, include_bytes!("fixtures/pairing.plist")).unwrap();
 
-    let engine = Engine::spawn(&tokio::runtime::Handle::current(), cfg(pairing));
+    let engine = Engine::spawn(cfg(pairing));
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(engine.status().phase, Phase::Connecting);
 
@@ -84,6 +81,28 @@ async fn commands_apply_while_connect_hangs() {
         "target not applied during connect"
     );
 
+    engine.send(Command::Shutdown);
+    assert!(wait_for(&engine, |s| s.phase == Phase::Stopped).await);
+}
+
+#[tokio::test]
+async fn rppairing_file_uses_the_rppairing_port() {
+    // Lockdown keys plus RPPairing keys, as Poof Setup writes on iOS 17.4+.
+    let mut merged: plist::Dictionary =
+        plist::from_bytes(include_bytes!("fixtures/pairing.plist")).unwrap();
+    let rp: plist::Dictionary =
+        plist::from_bytes(&idevice::remote_pairing::RpPairingFile::generate("t").to_bytes())
+            .unwrap();
+    merged.extend(rp);
+    let path = std::env::temp_dir().join(format!("poof-rp-{}.plist", std::process::id()));
+    plist::to_file_xml(&path, &merged).unwrap();
+
+    // Nothing listens on 127.0.0.1:49152, so the attempt fails there (and not
+    // at lockdown's 62078), and is retried rather than treated as fatal.
+    let engine = Engine::spawn(cfg(path));
+    assert!(wait_for(&engine, |s| s.phase == Phase::Retrying).await);
+    let err = engine.status().last_error.unwrap();
+    assert!(err.contains("RPPairing") && err.contains("49152"), "{err}");
     engine.send(Command::Shutdown);
     assert!(wait_for(&engine, |s| s.phase == Phase::Stopped).await);
 }

@@ -224,7 +224,7 @@ fn main() {
         setup(&rt);
     }
     let cfg = parse_args();
-    let engine = Engine::spawn(rt.handle(), cfg);
+    let engine = Engine::spawn(cfg);
 
     let stdin = std::io::stdin();
     let mut out = std::io::stdout();

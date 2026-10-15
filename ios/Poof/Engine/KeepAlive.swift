@@ -1,8 +1,11 @@
 import AVFoundation
+import CoreLocation
 import UIKit
 
 /// Keeps the app (and so the engine's connection) running in the background
-/// by playing silence through an audio session that mixes with other audio.
+/// by playing silence through an audio session that mixes with other audio,
+/// plus coarse background location updates as a second anchor (StikDebug uses
+/// the same pair; a game that grabs the audio session can stop the first).
 ///
 /// This is where the battery cost comes from: the process never suspends.
 /// iOS can still kill it under memory pressure, and a reboot always ends it.
@@ -11,10 +14,19 @@ final class KeepAlive {
 
     private var player: AVAudioPlayer?
     private var observers: [NSObjectProtocol] = []
+    private let location: CLLocationManager = {
+        let m = CLLocationManager()
+        // Coarse and never-changing: the point is staying resident, not fixes.
+        m.desiredAccuracy = kCLLocationAccuracyThreeKilometers
+        m.distanceFilter = CLLocationDistanceMax
+        m.pausesLocationUpdatesAutomatically = false
+        return m
+    }()
 
     private init() {}
 
     func start() {
+        startLocation()
         guard player == nil else { return }
         do {
             let session = AVAudioSession.sharedInstance()
@@ -33,11 +45,25 @@ final class KeepAlive {
     }
 
     func stop() {
+        location.stopUpdatingLocation()
         for o in observers { NotificationCenter.default.removeObserver(o) }
         observers.removeAll()
         player?.stop()
         player = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+
+    private func startLocation() {
+        switch location.authorizationStatus {
+        case .notDetermined:
+            location.requestAlwaysAuthorization()
+        case .denied, .restricted:
+            return // audio alone still works
+        default:
+            break
+        }
+        location.allowsBackgroundLocationUpdates = true
+        location.startUpdatingLocation()
     }
 
     /// Restarts playback if something stopped it. iOS doesn't promise an

@@ -9,7 +9,8 @@ Poof.app ──TCP──> 10.7.0.1 (loopback VPN, e.g. LocalDevVPN) ──> lock
    │                                                   │
    │  pairing file authenticates as a trusted "computer"
    │
-   ├─ iOS 17+: CoreDeviceProxy tunnel → RSD → com.apple.instruments.dtservicehub
+   ├─ iOS 17.4+: RPPairing (port 49152) → TLS-PSK tunnel → RSD → com.apple.instruments.dtservicehub
+   │           (required on iOS 26.4+; lockdown + CoreDeviceProxy is the fallback for 17.4–26.3)
    │           → LocationSimulation.simulateLocationWithLatitude:longitude:
    └─ iOS ≤16: com.apple.dt.simulatelocation (legacy; spoof persists without a session)
 ```

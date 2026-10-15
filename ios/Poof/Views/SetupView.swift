@@ -47,14 +47,13 @@ struct SetupView: View {
                             }
                         }
                     }
-                    TextField("Source", text: $store.ddiBase, axis: .vertical)
-                        .font(.caption.monospaced())
-                        .autocorrectionDisabled()
-                        .textInputAutocapitalization(.never)
+                    Text(AppStore.usesCryptexDDI ? "Cryptex image (iOS 26.4+)" : "Personalized image")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 } header: { step(4, "Developer disk image", done: store.hasDDI) }
 
                 Section {
-                    Stepper(value: $store.refreshSeconds, in: 0...300, step: 15) {
+                    Stepper(value: $store.refreshSeconds, in: 0...60, step: 5) {
                         LabeledContent("Re-send every", value: store.refreshSeconds == 0 ? "off" : "\(store.refreshSeconds) s")
                     }
                     Toggle("Restore last spot on launch", isOn: $store.autoResume)

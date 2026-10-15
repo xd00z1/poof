@@ -41,6 +41,8 @@ idevice = { version = "=0.1.68", default-features = false, features = [
     "heartbeat",
     "mobile_image_mounter",
     "tss",
+    "remote_pairing",
+    "cryptexd",
 ] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "fs"] }
 serde = { version = "1", features = ["derive"] }
@@ -58,3 +60,6 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+[dev-dependencies]
+idevice = { version = "=0.1.68", default-features = false, features = ["ring", "remote_pairing"] }

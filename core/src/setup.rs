@@ -32,10 +32,13 @@ use idevice::{
     lockdown::LockdownClient,
     pairing_file::PairingFile,
     provider::{IdeviceProvider, UsbmuxdProvider},
+    remote_pairing::{RemotePairingLockdownService, RpPairingFile},
     usbmuxd::{Connection, UsbmuxdAddr, UsbmuxdConnection},
 };
 
 pub const APP_BUNDLE_ID: &str = "app.poof.Poof";
+/// Host name presented when creating the RPPairing.
+const RP_HOST: &str = "Poof";
 /// How long to wait for the user to unlock the phone and tap Trust.
 const PAIR_TIMEOUT: Duration = Duration::from_secs(180);
 /// Name the app looks for in its Documents folder.
@@ -249,10 +252,20 @@ pub async fn run(opts: Options) -> Result<Report, String> {
         "Paired with iOS {ios_version}; network access enabled"
     ));
 
-    let bytes = pairing
+    let lockdown_bytes = pairing
         .clone()
         .serialize()
         .map_err(e("serialize pairing file"))?;
+    // iOS 26.4 no longer accepts the lockdown record over the network; the app
+    // connects with RPPairing instead (17.4+). One file carries both, like
+    // iloader writes it, so it also works with tools that read either half.
+    let bytes = if supports_rppairing(&ios_version) {
+        log("Creating RPPairing keys (iOS 17.4+)");
+        let rp = generate_rppairing(&provider).await?;
+        merge_plists(&lockdown_bytes, &rp.to_bytes())?
+    } else {
+        lockdown_bytes
+    };
     std::fs::write(&opts.out, &bytes)
         .map_err(|err| format!("write {}: {err}", opts.out.display()))?;
     log(&format!("Saved pairing file to {}", opts.out.display()));
@@ -314,6 +327,42 @@ pub async fn run(opts: Options) -> Result<Report, String> {
         installed,
         app_push_error,
     })
+}
+
+/// RPPairing over lockdown exists from iOS 17.4.
+fn supports_rppairing(v: &str) -> bool {
+    let mut parts = v.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+    let (major, minor) = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
+    major > 17 || (major == 17 && minor >= 4)
+}
+
+/// Pairs over USB through `com.apple.dt.remotepairingdeviced.lockdown`, the
+/// way iloader and idevice_pair do.
+async fn generate_rppairing(provider: &WithPairing) -> Result<RpPairingFile, String> {
+    let service = RemotePairingLockdownService::connect(provider)
+        .await
+        .map_err(e("RPPairing service"))?;
+    let mut client = service
+        .into_client(RP_HOST)
+        .map_err(e("RPPairing client"))?;
+    let mut rp = RpPairingFile::generate(RP_HOST);
+    client
+        .connect(&mut rp, || async { "000000".to_string() })
+        .await
+        .map_err(e("RPPairing"))?;
+    Ok(rp)
+}
+
+/// Both plists' keys in one XML plist (they don't overlap).
+fn merge_plists(a: &[u8], b: &[u8]) -> Result<Vec<u8>, String> {
+    let mut merged: plist::Dictionary =
+        plist::from_bytes(a).map_err(|err| format!("pairing plist: {err}"))?;
+    let extra: plist::Dictionary =
+        plist::from_bytes(b).map_err(|err| format!("RPPairing plist: {err}"))?;
+    merged.extend(extra);
+    let mut out = Vec::new();
+    plist::to_writer_xml(&mut out, &merged).map_err(|err| format!("write plist: {err}"))?;
+    Ok(out)
 }
 
 /// Filesystem-safe name for a server URL.
@@ -518,6 +567,17 @@ mod tests {
     fn storage_key_is_path_safe() {
         assert_eq!(storage_key("https://ani.jkcoxson.com"), "ani.jkcoxson.com");
         assert!(!storage_key("https://h:8080/a/../b").contains('/'));
+    }
+
+    #[test]
+    fn merges_pairing_halves() {
+        let lockdown = include_bytes!("../tests/fixtures/pairing.plist");
+        let rp = RpPairingFile::generate("test").to_bytes();
+        let merged = merge_plists(lockdown, &rp).unwrap();
+        assert!(PairingFile::from_bytes(&merged).is_ok());
+        assert!(RpPairingFile::from_bytes(&merged).is_ok());
+        assert!(supports_rppairing("17.4") && supports_rppairing("26.4.1"));
+        assert!(!supports_rppairing("17.3.1"));
     }
 
     #[test]

@@ -15,16 +15,24 @@ struct Favorite: Codable, Identifiable, Equatable {
 final class AppStore: ObservableObject {
     /// Source of the personalized developer disk image (the same files Xcode
     /// mounts). Override in Setup if this repository moves.
-    static let defaultDDIBase =
-        "https://raw.githubusercontent.com/doronz88/DeveloperDiskImage/main/PersonalizedImages/Xcode_iOS_DDI_Personalized"
-    static let ddiFiles = ["BuildManifest.plist", "Image.dmg", "Image.dmg.trustcache"]
+    /// iOS 26.4+ installs the developer disk image as a cryptex; earlier
+    /// versions mount the personalized image. Same split as StikDebug.
+    static let usesCryptexDDI: Bool = {
+        let v = ProcessInfo.processInfo.operatingSystemVersion
+        return v.majorVersion > 26 || (v.majorVersion == 26 && v.minorVersion >= 4)
+    }()
+    static let ddiBase = usesCryptexDDI
+        ? "https://raw.githubusercontent.com/doronz88/DeveloperDiskImage/main/PersonalizedImages/Xcode_iOS_DDI_Cryptex"
+        : "https://raw.githubusercontent.com/doronz88/DeveloperDiskImage/main/PersonalizedImages/Xcode_iOS_DDI_Personalized"
+    static let ddiFiles = usesCryptexDDI
+        ? ["BuildManifest.plist", "Image.dmg", "Image.dmg.trustcache", "Image.dmg.cryptex_info", "Image.dmg.root_hash"]
+        : ["BuildManifest.plist", "Image.dmg", "Image.dmg.trustcache"]
 
     private let defaults = UserDefaults.standard
 
     @Published var deviceIP: String { didSet { defaults.set(deviceIP, forKey: "deviceIP") } }
     @Published var refreshSeconds: Int { didSet { defaults.set(refreshSeconds, forKey: "refreshSeconds") } }
     @Published var autoResume: Bool { didSet { defaults.set(autoResume, forKey: "autoResume") } }
-    @Published var ddiBase: String { didSet { defaults.set(ddiBase, forKey: "ddiBase") } }
     @Published var favorites: [Favorite] { didSet { save(favorites, "favorites") } }
     @Published private(set) var hasPairingFile = false
     @Published private(set) var hasDDI = false
@@ -46,7 +54,9 @@ final class AppStore: ObservableObject {
 
     let root: URL
     var pairingURL: URL { root.appendingPathComponent("pairing.plist") }
-    var ddiDirectory: URL { root.appendingPathComponent("DDI", isDirectory: true) }
+    var ddiDirectory: URL {
+        root.appendingPathComponent(Self.usesCryptexDDI ? "DDI-cryptex" : "DDI", isDirectory: true)
+    }
 
     init() {
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -54,9 +64,9 @@ final class AppStore: ObservableObject {
         try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
 
         deviceIP = defaults.string(forKey: "deviceIP") ?? "10.7.0.1"
-        refreshSeconds = defaults.object(forKey: "refreshSeconds") as? Int ?? 30
+        // StikDebug re-sends every 4 s; a dropped session is noticed that fast.
+        refreshSeconds = defaults.object(forKey: "refreshSeconds") as? Int ?? 5
         autoResume = defaults.object(forKey: "autoResume") as? Bool ?? true
-        ddiBase = defaults.string(forKey: "ddiBase") ?? Self.defaultDDIBase
         favorites = (defaults.data(forKey: "favorites"))
             .flatMap { try? JSONDecoder().decode([Favorite].self, from: $0) } ?? []
         rescan()
@@ -119,7 +129,7 @@ final class AppStore: ObservableObject {
         defer { ddiProgress = nil; rescan() }
         for (i, name) in Self.ddiFiles.enumerated() {
             ddiProgress = "Downloading \(name) (\(i + 1)/\(Self.ddiFiles.count))"
-            guard let url = URL(string: "\(ddiBase)/\(name)") else { throw URLError(.badURL) }
+            guard let url = URL(string: "\(Self.ddiBase)/\(name)") else { throw URLError(.badURL) }
             let (tmp, response) = try await URLSession.shared.download(from: url)
             guard (response as? HTTPURLResponse)?.statusCode == 200 else {
                 throw URLError(.badServerResponse, userInfo: [NSURLErrorFailingURLErrorKey: url])

@@ -32,7 +32,12 @@
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>
+		<string>location</string>
 	</array>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Poof keeps location updates running in the background so iOS doesn't suspend it and drop your spoofed location.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>Poof keeps location updates running in the background so iOS doesn't suspend it and drop your spoofed location.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Poof talks to this iPhone's own developer services through the loopback VPN.</string>
 	<key>UIFileSharingEnabled</key>
