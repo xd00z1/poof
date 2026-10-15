@@ -94,6 +94,7 @@ fn parse_line(line: &str) -> Result<Option<Command>, String> {
                 points,
                 speed_mps: speed.parse().map_err(|_| "bad speed")?,
                 repeat,
+                vary: false,
             };
             Mover::new(route.clone()).ok_or("need 2+ points and speed > 0")?;
             Ok(Some(Command::Walk(route)))

@@ -11,6 +11,8 @@ struct EngineStatus: Decodable, Equatable {
     var phase: String
     var target: Coord?
     var walking: Bool?
+    var routeRemainingM: Double?
+    var routeEtaS: Double?
     var iosVersion: String?
     var transport: String?
     var lastError: String?
@@ -25,26 +27,16 @@ struct EngineStatus: Decodable, Equatable {
     var isActive: Bool { phase == "active" }
 }
 
-enum Speed: String, CaseIterable, Identifiable {
-    case walk, jog, bike, drive
-
-    var id: String { rawValue }
-    var metresPerSecond: Double {
-        switch self {
-        case .walk: 1.4
-        case .jog: 2.8
-        case .bike: 5.5
-        case .drive: 13.4
-        }
-    }
-    var label: String { rawValue.capitalized }
-}
-
 /// Swift face of the Rust engine. Every call returns immediately; state comes
 /// back through `status`, polled while the app is in the foreground.
 @MainActor
 final class PoofEngine: ObservableObject {
     @Published private(set) var status = EngineStatus.stopped
+    /// The road route being travelled, for drawing on the map.
+    @Published private(set) var route: [CLLocationCoordinate2D] = []
+    @Published private(set) var vpnUp = VPNStatus.isActive
+    /// Set by the app; the watchdog and auto-downloads need it.
+    weak var store: AppStore?
 
     private var timer: Timer?
     /// Settings the running engine was started with.
@@ -72,6 +64,10 @@ final class PoofEngine: ObservableObject {
         let refresh = UInt32(max(0, store.refreshSeconds))
         let config = [store.pairingURL.path, store.deviceIP, ddi ?? "", String(refresh), store.pairingStamp]
         if status.isRunning, !status.isStuck, config == startedWith { return nil }
+        // Restarting a working session would show the real location for a
+        // moment. Changed settings wait until the session is not active.
+        if status.isActive, startedWith != nil { return nil }
+        if !store.hasDDI { store.downloadDDIInBackground { [weak self] in self?.restartIfStuck() } }
         let rc: Int32
         if let ddi {
             rc = poof_start(store.pairingURL.path, store.deviceIP, ddi, refresh)
@@ -95,28 +91,51 @@ final class PoofEngine: ObservableObject {
         return nil
     }
 
-    /// Walks from the current spoofed position to `dest`. Without a current
-    /// position there is nothing to walk from, so it teleports instead.
+    /// Travels along `planned` (a road or path route) at `mps`, with natural
+    /// speed changes and slowing for turns.
     @discardableResult
-    func walk(to dest: CLLocationCoordinate2D, speed: Speed, store: AppStore) -> String? {
-        guard let from = target else { return teleport(to: dest, store: store) }
+    func travel(_ planned: PlannedRoute, mps: Double, store: AppStore) -> String? {
         if let e = ensureStarted(store) { return e }
-
-        let route: [String: Any] = [
-            "points": [
-                ["lat": from.latitude, "lon": from.longitude],
-                ["lat": dest.latitude, "lon": dest.longitude],
-            ],
-            "speed_mps": speed.metresPerSecond,
+        let body: [String: Any] = [
+            "points": planned.points.map { ["lat": $0.latitude, "lon": $0.longitude] },
+            "speed_mps": mps,
             "loop": false,
+            "vary": true,
         ]
-        guard let data = try? JSONSerialization.data(withJSONObject: route),
+        guard let data = try? JSONSerialization.data(withJSONObject: body),
               let json = String(data: data, encoding: .utf8),
               poof_walk(json) == POOF_OK
-        else { return "Could not start the walk." }
-        store.lastTarget = dest
+        else { return "Could not start moving." }
+        route = planned.points
+        store.lastTarget = planned.points.last
         refresh()
         return nil
+    }
+
+    /// Stops moving and stays where the spoof is right now.
+    func holdHere(store: AppStore) {
+        guard let here = target else { return }
+        _ = poof_set_location(here.latitude, here.longitude)
+        store.lastTarget = here
+        route = []
+        refresh()
+    }
+
+    /// Called when iOS reports a location. Far from the spoof means it has
+    /// dropped: re-apply at once (the engine reconnects if needed).
+    func checkReportedLocation(_ loc: CLLocation) {
+        refresh()
+        guard let t = target, status.isRunning else { return }
+        let off = loc.distance(from: CLLocation(latitude: t.latitude, longitude: t.longitude))
+        if off > 1_000 {
+            _ = poof_set_location(t.latitude, t.longitude)
+            if status.isStuck { restartIfStuck() }
+        }
+    }
+
+    private func restartIfStuck() {
+        guard let store, status.isStuck || !status.isRunning, let t = store.lastTarget else { return }
+        _ = teleport(to: t, store: store)
     }
 
     /// Back to real GPS: clears the spoof and drops the connection, so nothing
@@ -134,9 +153,10 @@ final class PoofEngine: ObservableObject {
         let data = Data(String(cString: ptr).utf8)
         if let s = try? decoder.decode(EngineStatus.self, from: data), s != status {
             status = s
-            // Nothing to keep alive for until the user acts again.
-            if s.phase == "failed" { KeepAlive.shared.stop() }
+            if s.walking != true, !route.isEmpty { route = [] }
         }
+        let vpn = VPNStatus.isActive
+        if vpn != vpnUp { vpnUp = vpn }
     }
 
     func startPolling() {

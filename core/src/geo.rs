@@ -32,6 +32,15 @@ impl Coord {
         2.0 * EARTH_RADIUS_M * a.sqrt().min(1.0).asin()
     }
 
+    /// Initial great-circle bearing to `other`, degrees clockwise from north.
+    pub fn bearing_to(&self, other: &Coord) -> f64 {
+        let (p1, p2) = (self.lat.to_radians(), other.lat.to_radians());
+        let dl = (other.lon - self.lon).to_radians();
+        let y = dl.sin() * p2.cos();
+        let x = p1.cos() * p2.sin() - p1.sin() * p2.cos() * dl.cos();
+        y.atan2(x).to_degrees().rem_euclid(360.0)
+    }
+
     /// Linear interpolation. Adequate for the short segments of a walked route;
     /// longitude is unwrapped so a segment crossing the antimeridian takes the
     /// short way round.
@@ -63,7 +72,19 @@ pub struct Route {
     /// Start over from the first point after reaching the last one.
     #[serde(default, rename = "loop")]
     pub repeat: bool,
+    /// Drive like a person: speed drifts ±15% around `speed_mps` and slows
+    /// for sharp turns, instead of a constant-speed robot.
+    #[serde(default)]
+    pub vary: bool,
 }
+
+/// Speed through a sharp turn (≈ 22 km/h).
+const TURN_SPEED_MPS: f64 = 6.0;
+/// Start slowing this far before a sharp turn, and keep the speed down for the
+/// same distance after it.
+const TURN_ZONE_M: f64 = 25.0;
+/// Turns sharper than this count as sharp (degrees of heading change).
+const SHARP_TURN_DEG: f64 = 45.0;
 
 /// Position along a route, advanced by elapsed time.
 #[derive(Debug, Clone)]
@@ -72,6 +93,9 @@ pub struct Mover {
     segment: usize,
     /// Metres already travelled along the current segment.
     along: f64,
+    /// Current multiplier on the base speed when `vary` is set.
+    factor: f64,
+    rng: u64,
 }
 
 impl Mover {
@@ -90,11 +114,80 @@ impl Mover {
             .map(|w| w[0].distance_to(&w[1]))
             .sum();
         let valid = valid && !(route.repeat && length < 1.0);
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E37_79B9_7F4A_7C15);
         valid.then_some(Self {
             route,
             segment: 0,
             along: 0.0,
+            factor: 1.0,
+            rng: seed | 1,
         })
+    }
+
+    /// Metres left to the end of the route (one lap when looping).
+    pub fn remaining_m(&self) -> f64 {
+        let pts = &self.route.points;
+        if self.segment + 1 >= pts.len() {
+            return 0.0;
+        }
+        let current = pts[self.segment].distance_to(&pts[self.segment + 1]) - self.along;
+        let rest: f64 = pts[self.segment + 1..]
+            .windows(2)
+            .map(|w| w[0].distance_to(&w[1]))
+            .sum();
+        (current + rest).max(0.0)
+    }
+
+    /// Seconds to the end at the base speed.
+    pub fn eta_secs(&self) -> f64 {
+        self.remaining_m() / self.route.speed_mps
+    }
+
+    /// Uniform in [-1, 1) (xorshift64).
+    fn noise(&mut self) -> f64 {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        (self.rng >> 11) as f64 / (1u64 << 52) as f64 - 1.0
+    }
+
+    /// Heading change at vertex `i`, in degrees (0 = straight on).
+    fn turn_deg(&self, i: usize) -> f64 {
+        let pts = &self.route.points;
+        if i == 0 || i + 1 >= pts.len() {
+            return 0.0;
+        }
+        let (a, b) = (
+            pts[i - 1].bearing_to(&pts[i]),
+            pts[i].bearing_to(&pts[i + 1]),
+        );
+        let d = (b - a).rem_euclid(360.0);
+        d.min(360.0 - d)
+    }
+
+    /// Speed right now: the base speed, drifted and slowed for turns if `vary`.
+    fn speed_here(&self) -> f64 {
+        let base = self.route.speed_mps;
+        if !self.route.vary {
+            return base;
+        }
+        let pts = &self.route.points;
+        let v = base * self.factor;
+        if self.segment + 1 >= pts.len() {
+            return v;
+        }
+        let len = pts[self.segment].distance_to(&pts[self.segment + 1]);
+        let near_end =
+            len - self.along < TURN_ZONE_M && self.turn_deg(self.segment + 1) > SHARP_TURN_DEG;
+        let near_start = self.along < TURN_ZONE_M && self.turn_deg(self.segment) > SHARP_TURN_DEG;
+        if near_end || near_start {
+            v.min(TURN_SPEED_MPS)
+        } else {
+            v
+        }
     }
 
     pub fn position(&self) -> Coord {
@@ -116,24 +209,34 @@ impl Mover {
 
     /// Advances by `secs` of travel and returns the new position.
     pub fn advance(&mut self, secs: f64) -> Coord {
-        let mut remaining = self.route.speed_mps * secs.max(0.0);
-        let pts = &self.route.points;
-        while remaining > 0.0 && !self.finished() {
-            if self.segment + 1 >= pts.len() {
-                // Only reachable when repeating.
-                self.segment = 0;
-                self.along = 0.0;
-                continue;
-            }
-            let len = pts[self.segment].distance_to(&pts[self.segment + 1]);
-            let left = len - self.along;
-            if remaining < left {
-                self.along += remaining;
-                remaining = 0.0;
-            } else {
-                remaining -= left;
-                self.segment += 1;
-                self.along = 0.0;
+        if self.route.vary {
+            // Slow random walk of the speed, kept within ±15%.
+            self.factor = (self.factor + 0.04 * self.noise() * secs.min(5.0)).clamp(0.85, 1.15);
+        }
+        // Sub-steps so turn slow-downs apply where they happen.
+        let mut time = secs.max(0.0);
+        while time > 0.0 && !self.finished() {
+            let dt = time.min(0.25);
+            time -= dt;
+            let mut remaining = self.speed_here() * dt;
+            let pts = &self.route.points;
+            while remaining > 0.0 && !self.finished() {
+                if self.segment + 1 >= pts.len() {
+                    // Only reachable when repeating.
+                    self.segment = 0;
+                    self.along = 0.0;
+                    continue;
+                }
+                let len = pts[self.segment].distance_to(&pts[self.segment + 1]);
+                let left = len - self.along;
+                if remaining < left {
+                    self.along += remaining;
+                    remaining = 0.0;
+                } else {
+                    remaining -= left;
+                    self.segment += 1;
+                    self.along = 0.0;
+                }
             }
         }
         self.position()
@@ -171,6 +274,7 @@ mod tests {
             points: vec![a, b],
             speed_mps: 10.0,
             repeat: false,
+            vary: false,
         })
         .unwrap();
         let p = m.advance(5.0);
@@ -190,6 +294,7 @@ mod tests {
             points: vec![a, b],
             speed_mps: 1.0,
             repeat: true,
+            vary: false,
         })
         .unwrap();
         let p = m.advance(len + 10.0);
@@ -213,7 +318,8 @@ mod tests {
             Mover::new(Route {
                 points: vec![c(0.0, 0.0)],
                 speed_mps: 1.0,
-                repeat: false
+                repeat: false,
+                vary: false
             })
             .is_none()
         );
@@ -221,7 +327,8 @@ mod tests {
             Mover::new(Route {
                 points: vec![c(0.0, 0.0), c(1.0, 1.0)],
                 speed_mps: 0.0,
-                repeat: false
+                repeat: false,
+                vary: false
             })
             .is_none()
         );
@@ -234,11 +341,78 @@ mod tests {
             points: vec![p, p],
             speed_mps: 1.0,
             repeat,
+            vary: false,
         };
         assert!(Mover::new(r(true)).is_none());
         // Non-repeating is fine: it finishes on the first step.
         let mut m = Mover::new(r(false)).unwrap();
         assert_eq!(m.advance(1.0), p);
         assert!(m.finished());
+    }
+
+    #[test]
+    fn bearing_cardinal() {
+        let o = c(0.0, 0.0);
+        assert!((o.bearing_to(&c(1.0, 0.0)) - 0.0).abs() < 1e-6);
+        assert!((o.bearing_to(&c(0.0, 1.0)) - 90.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn remaining_and_eta() {
+        let (a, b) = (c(0.0, 0.0), c(0.0, 0.01)); // ~1.1 km
+        let len = a.distance_to(&b);
+        let mut m = Mover::new(Route {
+            points: vec![a, b],
+            speed_mps: 10.0,
+            repeat: false,
+            vary: false,
+        })
+        .unwrap();
+        assert!((m.remaining_m() - len).abs() < 0.5);
+        m.advance(10.0);
+        assert!((m.remaining_m() - (len - 100.0)).abs() < 0.5);
+        assert!((m.eta_secs() - (len - 100.0) / 10.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn varied_speed_stays_in_band_and_slows_for_turns() {
+        // East 2 km, then a 90° turn north for 2 km.
+        let pts = vec![c(0.0, 0.0), c(0.0, 0.018), c(0.018, 0.018)];
+        let total: f64 = pts.windows(2).map(|w| w[0].distance_to(&w[1])).sum();
+        let mut m = Mover::new(Route {
+            points: pts,
+            speed_mps: 20.0,
+            repeat: false,
+            vary: true,
+        })
+        .unwrap();
+        let mut secs = 0.0;
+        while !m.finished() && secs < 1000.0 {
+            m.advance(1.0);
+            secs += 1.0;
+        }
+        assert!(m.finished());
+        // ±15% drift plus a short slow zone at the corner.
+        let nominal = total / 20.0;
+        assert!(
+            secs > nominal * 0.85 && secs < nominal * 1.25,
+            "{secs} vs {nominal}"
+        );
+
+        // Speed through the corner is capped.
+        let mut m = Mover::new(Route {
+            points: vec![c(0.0, 0.0), c(0.0, 0.018), c(0.018, 0.018)],
+            speed_mps: 20.0,
+            repeat: false,
+            vary: true,
+        })
+        .unwrap();
+        let corner = c(0.0, 0.018);
+        while m.position().distance_to(&corner) > 20.0 {
+            m.advance(0.25);
+        }
+        let before = m.position();
+        m.advance(1.0);
+        assert!(before.distance_to(&m.position()) <= TURN_SPEED_MPS + 0.5);
     }
 }

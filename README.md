@@ -84,6 +84,17 @@ quit
 | `core/src/bin/poof.rs` | Desktop CLI (`setup` + engine driver) |
 | `ios/` | SwiftUI app (XcodeGen `project.yml`) |
 
+## When can the real location show?
+
+On iOS 17+ the spoof only exists while Poof's connection to the phone's location service is open. iOS reverts the moment it closes, and no app can change that (Apple's older service, where the spoof survived a disconnect, is iOS 16 and earlier only). Poof is built to keep that from happening, and to make it short when it can't:
+
+- **Poof never causes a gap itself.** Settings changes wait until the spoof is idle, and moving or stopping never reconnects.
+- **Drops are prevented.** Silent audio plus background location keep Poof resident, and LocalDevVPN's on-demand rule brings the VPN back by itself.
+- **Drops are short.** A re-send every 2 s notices a dead connection, Poof reconnects at once, and a location watchdog re-applies the spoof the moment iOS reports a position more than 1 km away.
+- **You're told.** A red banner shows whenever the VPN is off or Poof is reconnecting.
+
+What still shows the real location: a reboot (until you open Poof), iOS killing Poof, or LocalDevVPN switched off.
+
 ## Limits and risks
 
 - **Detection.** Apps can detect the spoof. They can compare GPS against Wi-Fi, cell or IP location, check `CLLocationSourceInformation.isSimulatedBySoftware` (iOS 15+), or notice that Developer Mode is on. Poof doesn't hide any of this. Accounts tied to location (games, dating, banking geofences) can be flagged or banned. Teleporting long distances makes that likelier, so use **Move**.

@@ -53,11 +53,11 @@ struct SetupView: View {
                 } header: { step(4, "Developer disk image", done: store.hasDDI) }
 
                 Section {
-                    Stepper(value: $store.refreshSeconds, in: 0...60, step: 5) {
+                    Stepper(value: $store.refreshSeconds, in: 1...10, step: 1) {
                         LabeledContent("Re-send every", value: store.refreshSeconds == 0 ? "off" : "\(store.refreshSeconds) s")
                     }
                     Toggle("Restore last spot on launch", isOn: $store.autoResume)
-                    Text("Re-sending detects a dropped connection sooner, at some battery cost. Changes apply on your next Teleport.")
+                    Text("If the connection ever drops, iOS shows your real location until Poof notices and reconnects. A short interval keeps that gap to a second or two; the battery cost is small. Changes apply the next time Poof isn't spoofing.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 } header: { Text("Keep-alive") }

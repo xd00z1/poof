@@ -9,21 +9,39 @@ import UIKit
 ///
 /// This is where the battery cost comes from: the process never suspends.
 /// iOS can still kill it under memory pressure, and a reboot always ends it.
-final class KeepAlive {
+final class KeepAlive: NSObject, CLLocationManagerDelegate {
     static let shared = KeepAlive()
+
+    /// Every location iOS reports while running. The engine uses it as a
+    /// watchdog: a report far from the spoof means the spoof dropped.
+    var onLocation: ((CLLocation) -> Void)?
 
     private var player: AVAudioPlayer?
     private var observers: [NSObjectProtocol] = []
     private let location: CLLocationManager = {
         let m = CLLocationManager()
-        // Coarse and never-changing: the point is staying resident, not fixes.
-        m.desiredAccuracy = kCLLocationAccuracyThreeKilometers
-        m.distanceFilter = CLLocationDistanceMax
+        // Coarse: the point is staying resident and noticing big jumps (the
+        // spoof dropping), not precise fixes. While the spoof holds still,
+        // nothing changes and no updates arrive.
+        m.desiredAccuracy = kCLLocationAccuracyKilometer
+        m.distanceFilter = 500
         m.pausesLocationUpdatesAutomatically = false
         return m
     }()
 
-    private init() {}
+    private override init() {
+        super.init()
+        location.delegate = self
+    }
+
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        guard let last = locations.last else { return }
+        DispatchQueue.main.async { self.onLocation?(last) }
+    }
+
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        if player != nil { startLocation() }
+    }
 
     func start() {
         startLocation()

@@ -47,7 +47,9 @@ use crate::geo::{Coord, Mover, Route};
 /// Any single request to the device that takes longer than this is treated as
 /// a dead connection.
 const OP_TIMEOUT: Duration = Duration::from_secs(15);
-const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// Retries stay frequent: every second the session is down, the phone shows
+/// its real location. A failed attempt (VPN off) costs one refused TCP connect.
+const MAX_BACKOFF: Duration = Duration::from_secs(5);
 /// How often a walked route reports a new position.
 const ROUTE_STEP: Duration = Duration::from_secs(1);
 /// Upload (~16 MB through the VPN) plus Apple's TSS signing round trip.
@@ -118,6 +120,9 @@ pub struct Status {
     pub phase: Phase,
     pub target: Option<Coord>,
     pub walking: bool,
+    /// Metres and seconds left on the route being travelled.
+    pub route_remaining_m: Option<f64>,
+    pub route_eta_s: Option<f64>,
     pub ios_version: Option<String>,
     /// "tunnel" (iOS 17+, CoreDeviceProxy + DVT) or "legacy" (com.apple.dt.simulatelocation).
     pub transport: Option<&'static str>,
@@ -133,6 +138,8 @@ impl Default for Status {
             phase: Phase::Connecting,
             target: None,
             walking: false,
+            route_remaining_m: None,
+            route_eta_s: None,
             ios_version: None,
             transport: None,
             last_error: None,
@@ -232,6 +239,8 @@ fn sync_intent(status: &Shared, intent: &Intent) {
     update(status, |s| {
         s.target = intent.target;
         s.walking = intent.mover.is_some();
+        s.route_remaining_m = intent.mover.as_ref().map(|m| m.remaining_m());
+        s.route_eta_s = intent.mover.as_ref().map(|m| m.eta_secs());
     });
 }
 
@@ -254,7 +263,9 @@ async fn run(cfg: Config, mut rx: mpsc::UnboundedReceiver<Command>, status: Shar
                 tracing::warn!("session ended: {msg}");
                 let was_active = status.lock().unwrap().phase == Phase::Active;
                 if was_active {
-                    backoff = Duration::from_secs(1);
+                    // The phone is showing its real location from this moment:
+                    // reconnect at once, not after a wait.
+                    backoff = Duration::ZERO;
                 }
                 update(&status, |s| {
                     s.last_error = Some(msg);
@@ -296,7 +307,7 @@ async fn run(cfg: Config, mut rx: mpsc::UnboundedReceiver<Command>, status: Shar
                 }
             }
         }
-        backoff = (backoff * 2).min(MAX_BACKOFF);
+        backoff = (backoff * 2).clamp(Duration::from_secs(1), MAX_BACKOFF);
     }
     update(&status, |s| s.phase = Phase::Stopped);
 }

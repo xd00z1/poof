@@ -31,7 +31,10 @@ final class AppStore: ObservableObject {
     private let defaults = UserDefaults.standard
 
     @Published var deviceIP: String { didSet { defaults.set(deviceIP, forKey: "deviceIP") } }
-    @Published var refreshSeconds: Int { didSet { defaults.set(refreshSeconds, forKey: "refreshSeconds") } }
+    @Published var refreshSeconds: Int { didSet { defaults.set(refreshSeconds, forKey: "refreshSeconds2") } }
+    @Published var driveSpeed: DriveSpeed = .auto {
+        didSet { defaults.set(driveSpeed.rawValue, forKey: "driveSpeed") }
+    }
     @Published var autoResume: Bool { didSet { defaults.set(autoResume, forKey: "autoResume") } }
     @Published var favorites: [Favorite] { didSet { save(favorites, "favorites") } }
     @Published private(set) var hasPairingFile = false
@@ -64,9 +67,11 @@ final class AppStore: ObservableObject {
         try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
 
         deviceIP = defaults.string(forKey: "deviceIP") ?? "10.7.0.1"
-        // StikDebug re-sends every 4 s; a dropped session is noticed that fast.
-        refreshSeconds = defaults.object(forKey: "refreshSeconds") as? Int ?? 5
+        // A drop shows the real location until it is noticed; re-sending every
+        // 2 s keeps that gap short (StikDebug uses 4 s).
+        refreshSeconds = defaults.object(forKey: "refreshSeconds2") as? Int ?? 2
         autoResume = defaults.object(forKey: "autoResume") as? Bool ?? true
+        driveSpeed = DriveSpeed(rawValue: defaults.integer(forKey: "driveSpeed")) ?? .auto
         favorites = (defaults.data(forKey: "favorites"))
             .flatMap { try? JSONDecoder().decode([Favorite].self, from: $0) } ?? []
         rescan()
@@ -120,6 +125,16 @@ final class AppStore: ObservableObject {
             throw NSError(domain: "Poof", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: "That is not a pairing file (missing HostID / keys).",
             ])
+        }
+    }
+
+    /// Fetches the disk image if it is missing, once at a time, then calls
+    /// `done`. Errors show up in Setup; the engine reports what is missing.
+    func downloadDDIInBackground(_ done: @escaping () -> Void) {
+        guard !hasDDI, ddiProgress == nil else { return }
+        Task {
+            try? await downloadDDI()
+            done()
         }
     }
 

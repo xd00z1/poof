@@ -11,7 +11,15 @@ struct PoofApp: App {
             ContentView()
                 .environmentObject(store)
                 .environmentObject(engine)
-                .task { resumeIfNeeded() }
+                .task {
+                    engine.store = store
+                    let e = engine
+                    KeepAlive.shared.onLocation = { [weak e] loc in
+                        Task { @MainActor in e?.checkReportedLocation(loc) }
+                    }
+                    SigningExpiry.scheduleReminders()
+                    resumeIfNeeded()
+                }
                 .onChange(of: scenePhase, initial: true) { _, phase in
                     // Poll only while visible; the engine itself keeps running.
                     if phase == .active {
