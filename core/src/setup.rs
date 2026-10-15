@@ -412,7 +412,7 @@ async fn sign_in(
             } else if msg.contains("-22406") {
                 format!(
                     "{msg}\nIf this password works at account.apple.com, the anisette server \
-                     is the likely cause: pick another one and try again."
+                     is the likely cause: pick the other one and try again."
                 )
             } else {
                 msg

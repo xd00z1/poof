@@ -10,22 +10,23 @@ struct SetupView: View {
     @State private var revoke = false
     @State private var code = ""
     @State private var customIPA: URL?
-    @AppStorage("anisetteServer2") private var anisetteServer = AnisetteServer.defaultServer
+    @AppStorage("anisetteServerWin") private var anisetteServer = AnisetteServer.defaultServer
     @AppStorage("anisetteCustom") private var anisetteCustom = ""
 
     /// Public servers that supply the "anisette" device headers Apple's sign-in
     /// requires. When one misbehaves Apple answers "wrong password".
+    /// Since mid-October 2026 Apple only accepts anisette from Windows-based
+    /// servers; the older Android-based ones (ani.sidestore.io,
+    /// ani.stikstore.app, ...) get -80045 or HTTP 503.
     enum AnisetteServer: String, CaseIterable, Identifiable {
         case defaultServer = "default"
-        case stikstore = "https://ani.stikstore.app"
-        case sidestore = "https://ani.sidestore.io"
+        case stikstore2 = "https://ani2.stikstore.app"
         case custom = "custom"
         var id: String { rawValue }
         var label: String {
             switch self {
-            case .defaultServer: "Default (ani.jkcoxson.com)"
-            case .stikstore: "StikStore"
-            case .sidestore: "SideStore"
+            case .defaultServer: "ani.jkcoxson.com (default)"
+            case .stikstore2: "ani2.stikstore.app"
             case .custom: "Custom…"
             }
         }
